@@ -58,28 +58,52 @@ assert_eq!(pipeline.run(12), Ok(true));
 assert_eq!(pipeline.run(0), Err("empty"));
 ```
 
-## Static branching
+## Branching
 
-`then_branch` selects one sub-pipeline without allocating or dynamically
-dispatching. The predicate borrows the intermediate value; exactly one branch
-then consumes it. Both branches must produce the same type, after which normal
-composition continues.
+Branching is an ordinary `if` or `match` inside a stage, so the crate provides
+no combinator for it. `match` dispatches over any number of arms, and the
+compiler already requires every arm to produce the same type. Only the selected
+arm runs, and nothing is allocated or dynamically dispatched.
 
 ```rust
 use skid_pipe::Pipe;
 
-let mut pipeline = Pipe::new(|value: i32| value).then_branch(
-    |value: &i32| *value >= 0,
-    Pipe::new(|value: i32| value * 2),
-    Pipe::new(|value: i32| -value),
-);
+let mut pipeline = Pipe::new(|value: i32| value)
+    .then(|value: i32| match value.signum() {
+        1 => value * 2,
+        -1 => -value,
+        _ => 0,
+    })
+    .then(|value: i32| value + 1);
 
-assert_eq!(pipeline.run(4), 8);
-assert_eq!(pipeline.run(-4), 4);
+assert_eq!(pipeline.run(4), 9);
+assert_eq!(pipeline.run(-4), 5);
 ```
 
-`AsyncPipe::then_branch` has the same contract. Predicate evaluation is
-synchronous, while only the selected branch future is awaited.
+`AsyncPipe` branches the same way, awaiting only the selected arm. A stage
+closure is `FnMut`, so a branch that keeps state across runs holds that state
+in a `Cell` captured by shared reference; moving it into the returned future
+would make the closure `FnOnce` and it could no longer be a repeatable stage.
+
+```rust
+use core::cell::Cell;
+use skid_pipe::AsyncPipe;
+
+# async fn example() {
+let taken = Cell::new(0_u32);
+
+let mut pipeline = AsyncPipe::new(|value: i32| core::future::ready(value)).then(|value: i32| {
+    let taken = &taken;
+    async move {
+        taken.set(taken.get() + 1);
+        if value >= 0 { value * 2 } else { -value }
+    }
+});
+
+assert_eq!(pipeline.run(4).await, 8);
+assert_eq!(taken.get(), 1);
+# }
+```
 
 ## Asynchronous composition
 
@@ -108,6 +132,60 @@ or another environment. The returned future holds the mutable pipeline borrow
 until it completes, so stateful stages cannot be run concurrently. The core
 crate does not depend on any executor.
 
+## Type erasure
+
+A pipeline's concrete type nests with every step
+(`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Three opt-in layers hide that name,
+ordered by cost; the default build keeps the first two, which stay
+allocation-free.
+
+Return `impl Chain` from a builder function (zero cost), or borrow any
+pipeline as `DynChain` / `DynTryChain` (no allocation, one indirect call per
+run):
+
+```rust
+use skid_pipe::{Chain, DynChain, Pipe};
+
+fn build() -> impl Chain<u16, Output = bool> {
+    Pipe::new(|value: u16| value as f32 / 4095.0).then(|value: f32| value > 0.5)
+}
+
+let mut pipeline = build();
+let erased: DynChain<'_, u16, bool> = &mut pipeline;
+assert!(erased.run(3000));
+```
+
+With the `alloc` feature (or `std`, which implies it), `BoxedPipe` and
+`BoxedTryPipe` own a fully erased pipeline and compose it at runtime:
+
+```rust
+use skid_pipe::{BoxedPipe, Pipe};
+
+let offsets = vec![1, 2, 3];
+let mut pipeline = BoxedPipe::new(Pipe::new(|value: i32| value));
+
+for offset in offsets {
+    pipeline = pipeline.then(move |value| value + offset);
+}
+
+assert_eq!(pipeline.run(10), 16);
+```
+
+`Step`, `TryStep`, and `AsyncStep` are public and open to hand-written
+implementations for named stateful stages. `AsyncChain` supports only the
+`impl AsyncChain` boundary layer: its `run` returns `impl Future`, so the
+trait is not dyn-compatible and the crate offers no boxed asynchronous
+pipeline.
+
+## Features
+
+- `alloc` — `BoxedPipe` and `BoxedTryPipe`; requires only the `alloc` crate,
+  so it works on `no_std` targets with a heap allocator.
+- `std` — currently just implies `alloc`.
+
+The default feature set is empty and the core stays dependency- and
+allocation-free.
+
 ## Embedded integrations
 
 The core crate remains dependency-free for every target; there is intentionally
@@ -120,7 +198,9 @@ in an opt-in adapter crate rather than in this core API.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo test --all-features
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32v1-none
 cargo check --target thumbv6m-none-eabi
