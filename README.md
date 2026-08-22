@@ -1,17 +1,21 @@
 # skid-pipe
 
-> Dependency-free, statically composed typed function pipelines for `no_std`.
+> Reusable, state-capable, fully static computation pipelines for Rust `core`.
 
 `skid-pipe` turns a chain of ordinary Rust functions into a reusable value.
-It uses only `core`:
+Its shipped library uses only `core`:
 
 - `no_std`
-- zero dependencies
+- zero library dependencies
 - zero allocation
 - static dispatch
 - no runtime or executor
 - no `unsafe`
 - native, WebAssembly, and embedded-core compatible
+
+It is not an immediate-value pipe operator, a `Result`-only framework, or a
+network middleware stack. It is for defining an ordinary computation once and
+running that same typed computation repeatedly.
 
 ```rust
 use skid_pipe::Pipe;
@@ -53,6 +57,23 @@ you can:
 This crate does not replace Rust control flow. Branches remain ordinary
 `if`/`match` expressions inside stages.
 
+## Why this shape
+
+`Pipe::new(a).then(b).then(c)` stores `a → b → c` as one reusable value while
+preserving the type of every connection. This makes it a useful boundary for
+portable computation such as sensor processing, serialization, validation, or
+model pre/post-processing.
+
+The deliberately narrow contract is the point:
+
+- ordinary functions and `FnMut` closures, including captured state;
+- synchronous, fallible, and async computations as separate static APIs;
+- no allocator, executor, dynamic dispatch, macro expansion, or service model.
+
+Use a value-piping crate when execution should happen immediately. Use Tower
+when the problem is service readiness, backpressure, retry, timeout, or HTTP
+middleware.
+
 ## Core model
 
 Appending a stage creates a new recursive type:
@@ -79,6 +100,28 @@ input ──▶ F1 ──▶ F2 ──▶ F3 ──▶ output
 ```
 
 The core path allocates nothing and uses no dynamic dispatch.
+
+## Cost model and benchmark
+
+The recursive generic representation gives the compiler complete visibility of
+every stage. It adds no allocation or virtual call, but exact generated code
+still depends on the compiler, target, and stages. Long pipelines with many
+distinct type combinations can also increase compile time and binary size.
+
+The native Criterion benchmark compares equivalent three-stage direct calls
+with `Pipe`, `TryPipe`, and `AsyncPipe` composition. Construction is outside
+the measured loop, matching a reusable pipeline's normal use:
+
+```sh
+cargo bench --bench composition
+```
+
+Criterion is a benchmark-only development dependency; the published library's
+normal dependency graph remains empty.
+
+Treat the resulting nanoseconds as machine-local evidence, not a portable
+performance promise. Flash size, stack use, and assembly require target-specific
+measurement before making embedded optimization claims.
 
 ## Examples
 
@@ -237,7 +280,7 @@ ordinary procedural Rust is usually clearer.
 
 ## Platform validation
 
-CI checks the static core on stable Rust and the declared MSRV, including
+CI checks the static core on stable Rust and the declared MSRV (Rust 1.86), including
 representative targets:
 
 - `wasm32-unknown-unknown`
@@ -255,6 +298,7 @@ logging framework, or model runtime belong in separate adapter crates.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo bench --bench composition
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32v1-none
 cargo check --target thumbv6m-none-eabi
