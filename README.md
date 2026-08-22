@@ -108,6 +108,60 @@ or another environment. The returned future holds the mutable pipeline borrow
 until it completes, so stateful stages cannot be run concurrently. The core
 crate does not depend on any executor.
 
+## Type erasure
+
+A pipeline's concrete type nests with every step
+(`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Three opt-in layers hide that name,
+ordered by cost; the default build keeps the first two, which stay
+allocation-free.
+
+Return `impl Chain` from a builder function (zero cost), or borrow any
+pipeline as `DynChain` / `DynTryChain` (no allocation, one indirect call per
+run):
+
+```rust
+use skid_pipe::{Chain, DynChain, Pipe};
+
+fn build() -> impl Chain<u16, Output = bool> {
+    Pipe::new(|value: u16| value as f32 / 4095.0).then(|value: f32| value > 0.5)
+}
+
+let mut pipeline = build();
+let erased: DynChain<'_, u16, bool> = &mut pipeline;
+assert!(erased.run(3000));
+```
+
+With the `alloc` feature (or `std`, which implies it), `BoxedPipe` and
+`BoxedTryPipe` own a fully erased pipeline and compose it at runtime:
+
+```rust
+use skid_pipe::{BoxedPipe, Pipe};
+
+let offsets = vec![1, 2, 3];
+let mut pipeline = BoxedPipe::new(Pipe::new(|value: i32| value));
+
+for offset in offsets {
+    pipeline = pipeline.then(move |value| value + offset);
+}
+
+assert_eq!(pipeline.run(10), 16);
+```
+
+`Step`, `TryStep`, and `AsyncStep` are public and open to hand-written
+implementations for named stateful stages. `AsyncChain` supports only the
+`impl AsyncChain` boundary layer: its `run` returns `impl Future`, so the
+trait is not dyn-compatible and the crate offers no boxed asynchronous
+pipeline.
+
+## Features
+
+- `alloc` — `BoxedPipe` and `BoxedTryPipe`; requires only the `alloc` crate,
+  so it works on `no_std` targets with a heap allocator.
+- `std` — currently just implies `alloc`.
+
+The default feature set is empty and the core stays dependency- and
+allocation-free.
+
 ## Embedded integrations
 
 The core crate remains dependency-free for every target; there is intentionally
@@ -120,7 +174,9 @@ in an opt-in adapter crate rather than in this core API.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo test --all-features
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32v1-none
 cargo check --target thumbv6m-none-eabi

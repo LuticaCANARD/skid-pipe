@@ -74,10 +74,10 @@ impl<Head, Tail> AsyncPipe<Head, Tail> {
 
 /// A callable asynchronous pipeline stage.
 ///
-/// This trait is public only because it supports the public [`AsyncPipe`]
-/// implementation. Functions and closures that return a `Future` implement it
-/// automatically.
-#[doc(hidden)]
+/// Functions and closures that return a [`Future`] implement it
+/// automatically, so callers normally pass them straight to
+/// [`AsyncPipe::then`]. Implementing `AsyncStep` by hand is supported for
+/// named stateful stages.
 pub trait AsyncStep<Input> {
     /// The value emitted when the stage future resolves.
     type Output;
@@ -99,8 +99,18 @@ where
     }
 }
 
-/// Recursive implementation detail behind [`AsyncPipe::run`].
-#[doc(hidden)]
+/// A complete asynchronous pipeline, runnable for one input value.
+///
+/// [`AsyncPipe`] and [`End`](crate::End) implement this trait; it is the
+/// recursive engine behind [`AsyncPipe::run`]. It is public so builder
+/// functions can return `impl AsyncChain<Input, Output = O>` and hide the
+/// recursive concrete pipeline type at zero cost.
+///
+/// Unlike [`Chain`](crate::Chain), this trait is **not dyn-compatible**:
+/// `run` returns `impl Future`, so there is no `&mut dyn AsyncChain`
+/// counterpart to [`DynChain`](crate::DynChain). Erasing an asynchronous
+/// pipeline requires boxing each returned future, which this crate does not
+/// do; use `impl AsyncChain` at API boundaries instead.
 pub trait AsyncChain<Input> {
     /// The value emitted when this chain's future resolves.
     type Output;

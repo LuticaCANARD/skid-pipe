@@ -13,3 +13,5 @@ path = "src/lib.rs"
 
 [features]
 default = []
+alloc = []
+std = ["alloc"]

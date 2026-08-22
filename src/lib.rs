@@ -57,6 +57,36 @@
 //! # }
 //! ```
 //!
+//! # Type erasure
+//!
+//! A pipeline's concrete type nests with every step
+//! (`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Three opt-in layers hide that
+//! name, ordered by cost:
+//!
+//! - Return `impl Chain<Input, Output = O>` (or `impl TryChain` /
+//!   `impl AsyncChain`) from a builder function — zero cost.
+//! - Borrow any pipeline as [`DynChain`] / [`DynTryChain`] — no allocation,
+//!   one indirect call per run, works on every `no_std` target.
+//! - With the `alloc` feature (or `std`, which implies it), own a fully
+//!   erased pipeline as [`BoxedPipe`] / [`BoxedTryPipe`] and compose it at
+//!   runtime.
+//!
+//! ```
+//! use skid_pipe::{Chain, DynChain, Pipe};
+//!
+//! fn build() -> impl Chain<u16, Output = bool> {
+//!     Pipe::new(|value: u16| value as f32 / 4095.0).then(|value: f32| value > 0.5)
+//! }
+//!
+//! let mut pipeline = build();
+//! let erased: DynChain<'_, u16, bool> = &mut pipeline;
+//! assert!(erased.run(3000));
+//! ```
+//!
+//! [`AsyncChain`] supports only the first layer: its `run` returns
+//! `impl Future`, so the trait is not dyn-compatible and no unboxed erasure
+//! exists for asynchronous pipelines.
+//!
 //! ```compile_fail
 //! use skid_pipe::Pipe;
 //!
@@ -96,10 +126,17 @@
 //! let _ = pipeline.run(1_u8);
 //! ```
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 mod async_pipe;
+#[cfg(feature = "alloc")]
+mod boxed;
 mod pipe;
 mod try_pipe;
 
-pub use async_pipe::AsyncPipe;
-pub use pipe::{Branch, End, Pipe};
-pub use try_pipe::TryPipe;
+pub use async_pipe::{AsyncChain, AsyncPipe, AsyncStep};
+#[cfg(feature = "alloc")]
+pub use boxed::{BoxedPipe, BoxedTryPipe};
+pub use pipe::{Branch, Chain, DynChain, End, Pipe, Step};
+pub use try_pipe::{DynTryChain, TryChain, TryPipe, TryStep};
