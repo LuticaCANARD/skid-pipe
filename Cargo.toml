@@ -1,6 +1,6 @@
 [package]
 name = "skid-pipe"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Reusable, state-capable static computation pipelines for Rust core"
 license = "MIT"

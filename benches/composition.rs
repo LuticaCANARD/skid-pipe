@@ -1,5 +1,5 @@
+use core::future::{Future, Ready, ready};
 use std::{
-    future::Future,
     hint::black_box,
     pin::pin,
     task::{Context, Poll, Waker},
@@ -50,25 +50,27 @@ fn direct_fallible(input: u16) -> Result<bool, ()> {
     classify_fallible(normalized)
 }
 
+// Both benchmark arms await these exact `Ready<T>` stages. This isolates the
+// cost of composing them instead of comparing different future state machines.
 #[inline(never)]
-async fn decode_async(input: u16) -> u32 {
-    decode(input)
+fn decode_ready(input: u16) -> Ready<u32> {
+    ready(decode(input))
 }
 
 #[inline(never)]
-async fn normalize_async(input: u32) -> f32 {
-    normalize(input)
+fn normalize_ready(input: u32) -> Ready<f32> {
+    ready(normalize(input))
 }
 
 #[inline(never)]
-async fn classify_async(input: f32) -> bool {
-    classify(input)
+fn classify_ready(input: f32) -> Ready<bool> {
+    ready(classify(input))
 }
 
-async fn direct_async(input: u16) -> bool {
-    let decoded = decode_async(input).await;
-    let normalized = normalize_async(decoded).await;
-    classify_async(normalized).await
+async fn direct_ready(input: u16) -> bool {
+    let decoded = decode_ready(input).await;
+    let normalized = normalize_ready(decoded).await;
+    classify_ready(normalized).await
 }
 
 fn block_on<Output>(future: impl Future<Output = Output>) -> Output {
@@ -119,12 +121,12 @@ fn bench_async(c: &mut Criterion) {
     let mut group = c.benchmark_group("async_three_stage_ready");
 
     group.bench_function("direct", |bencher| {
-        bencher.iter(|| black_box(block_on(direct_async(black_box(INPUT)))));
+        bencher.iter(|| black_box(block_on(direct_ready(black_box(INPUT)))));
     });
 
-    let mut pipeline = AsyncPipe::new(decode_async)
-        .then(normalize_async)
-        .then(classify_async);
+    let mut pipeline = AsyncPipe::new(decode_ready)
+        .then(normalize_ready)
+        .then(classify_ready);
     group.bench_function("async_pipe", |bencher| {
         bencher.iter(|| black_box(block_on(pipeline.run(black_box(INPUT)))));
     });

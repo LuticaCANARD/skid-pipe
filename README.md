@@ -109,8 +109,9 @@ still depends on the compiler, target, and stages. Long pipelines with many
 distinct type combinations can also increase compile time and binary size.
 
 The native Criterion benchmark compares equivalent three-stage direct calls
-with `Pipe`, `TryPipe`, and `AsyncPipe` composition. Construction is outside
-the measured loop, matching a reusable pipeline's normal use:
+with `Pipe`, `TryPipe`, and `AsyncPipe` composition. Its async comparison uses
+the same `core::future::Ready`-returning stages on both sides. Construction is
+outside the measured loop, matching a reusable pipeline's normal use:
 
 ```sh
 cargo bench --bench composition
