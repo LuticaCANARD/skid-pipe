@@ -7,35 +7,27 @@ enum Input {
 
 #[derive(Debug, PartialEq)]
 enum Routed {
-    Sensor {
-        value: u16,
-        branch_runs: u32,
-    },
-    Command {
-        accepted: bool,
-        branch_runs: u32,
-    },
+    Sensor { value: u16, branch_runs: u32 },
+    Command { accepted: bool, branch_runs: u32 },
 }
 
 fn main() {
     let mut sensor_runs = 0_u32;
     let mut command_runs = 0_u32;
 
-    let mut pipeline = Pipe::new(|input: Input| input).then(move |input| {
-        match input {
-            Input::Sensor(value) => {
-                sensor_runs += 1;
-                Routed::Sensor {
-                    value: value.saturating_mul(2),
-                    branch_runs: sensor_runs,
-                }
+    let mut pipeline = Pipe::new(|input: Input| input).then(move |input| match input {
+        Input::Sensor(value) => {
+            sensor_runs += 1;
+            Routed::Sensor {
+                value: value.saturating_mul(2),
+                branch_runs: sensor_runs,
             }
-            Input::Command(command) => {
-                command_runs += 1;
-                Routed::Command {
-                    accepted: command == "start",
-                    branch_runs: command_runs,
-                }
+        }
+        Input::Command(command) => {
+            command_runs += 1;
+            Routed::Command {
+                accepted: command == "start",
+                branch_runs: command_runs,
             }
         }
     });

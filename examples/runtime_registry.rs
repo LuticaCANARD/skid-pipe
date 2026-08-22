@@ -31,9 +31,7 @@ fn main() -> Result<(), Error> {
             }
             "classify" => {
                 pipeline.push(|value| match value {
-                    Value::Decoded(value) => {
-                        Ok(Value::Classified(value > 10))
-                    }
+                    Value::Decoded(value) => Ok(Value::Classified(value > 10)),
                     _ => Err(Error::UnexpectedValue),
                 });
             }
@@ -41,10 +39,7 @@ fn main() -> Result<(), Error> {
         }
     }
 
-    assert_eq!(
-        pipeline.run(Value::Raw(12)),
-        Ok(Value::Classified(true)),
-    );
+    assert_eq!(pipeline.run(Value::Raw(12)), Ok(Value::Classified(true)),);
 
     Ok(())
 }

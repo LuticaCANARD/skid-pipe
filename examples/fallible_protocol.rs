@@ -32,13 +32,15 @@ fn validate(frame: Frame) -> Result<Frame, DecodeError> {
 }
 
 fn classify(frame: Frame) -> Result<&'static str, DecodeError> {
-    Ok(if frame.payload > 100 { "high" } else { "normal" })
+    Ok(if frame.payload > 100 {
+        "high"
+    } else {
+        "normal"
+    })
 }
 
 fn protocol_pipeline() -> impl TryChain<[u8; 3], DecodeError, Output = &'static str> {
-    TryPipe::new(decode)
-        .try_then(validate)
-        .try_then(classify)
+    TryPipe::new(decode).try_then(validate).try_then(classify)
 }
 
 fn main() {
@@ -49,8 +51,5 @@ fn main() {
         pipeline.run([2, 0, 120]),
         Err(DecodeError::UnsupportedVersion),
     );
-    assert_eq!(
-        pipeline.run([1, 0, 0]),
-        Err(DecodeError::EmptyPayload),
-    );
+    assert_eq!(pipeline.run([1, 0, 0]), Err(DecodeError::EmptyPayload),);
 }
