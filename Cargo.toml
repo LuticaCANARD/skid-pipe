@@ -1,0 +1,15 @@
+[package]
+name = "skid-pipe"
+version = "0.1.0"
+edition = "2024"
+description = "A tiny no_std typed pipeline for composing Rust functions"
+license = "MIT OR Apache-2.0"
+keywords = ["pipeline", "compose", "no-std", "wasm"]
+categories = ["no-std", "wasm"]
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []

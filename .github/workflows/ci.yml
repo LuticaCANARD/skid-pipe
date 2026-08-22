@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.85", stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: wasm32-unknown-unknown,wasm32v1-none,thumbv6m-none-eabi,thumbv7em-none-eabihf,riscv32imac-unknown-none-elf
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build
+      - run: rustdoc --test README.md --edition 2024 -L dependency=target/debug/deps --extern skid_pipe=target/debug/libskid_pipe.rlib
+      - run: cargo check --target wasm32-unknown-unknown
+      - run: cargo check --target wasm32v1-none
+      - run: cargo check --target thumbv6m-none-eabi
+      - run: cargo check --target thumbv7em-none-eabihf
+      - run: cargo check --target riscv32imac-unknown-none-elf
+      - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
