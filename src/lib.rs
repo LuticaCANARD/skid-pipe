@@ -3,9 +3,10 @@
 
 //! Portable, typed composition of ordinary Rust functions.
 //!
-//! `skid-pipe` is dependency-free and uses only [`core`]. It adds no allocator,
-//! dynamic dispatch, runtime, or executor requirement, so the same pipeline
-//! types work on native targets, WebAssembly, and `no_std` firmware.
+//! `skid-pipe` is dependency-free. Its default feature set uses only [`core`]
+//! and adds no allocator, dynamic dispatch, runtime, or executor requirement,
+//! so the same pipeline types work on native targets, WebAssembly, and
+//! `no_std` firmware. Allocation-backed layers are explicitly opt-in.
 //!
 //! # Synchronous pipeline
 //!
@@ -113,6 +114,15 @@
 //! `impl Future`, so the trait is not dyn-compatible and no unboxed erasure
 //! exists for asynchronous pipelines.
 //!
+//! # Dynamic composition
+//!
+//! The opt-in `dynamic` feature provides [`RuntimePipe`] for configurations
+//! that select registered steps at runtime. It implies `alloc`; each step is
+//! boxed and dynamically dispatched. A caller-defined carrier enum represents
+//! heterogeneous logical values, and runtime connection failures use the
+//! caller's error type. The default build remains fully static and
+//! allocation-free.
+//!
 //! ```compile_fail
 //! use skid_pipe::Pipe;
 //!
@@ -147,11 +157,15 @@ extern crate alloc;
 mod async_pipe;
 #[cfg(feature = "alloc")]
 mod boxed;
+#[cfg(feature = "dynamic")]
+mod dynamic;
 mod pipe;
 mod try_pipe;
 
 pub use async_pipe::{AsyncChain, AsyncPipe, AsyncStep};
 #[cfg(feature = "alloc")]
 pub use boxed::{BoxedPipe, BoxedTryPipe};
+#[cfg(feature = "dynamic")]
+pub use dynamic::{RuntimePipe, RuntimeStep};
 pub use pipe::{Chain, DynChain, End, Pipe, Step};
 pub use try_pipe::{DynTryChain, TryChain, TryPipe, TryStep};
