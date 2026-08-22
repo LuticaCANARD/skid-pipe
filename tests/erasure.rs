@@ -1,22 +1,11 @@
 use core::future::Future;
-use std::{
-    pin::pin,
-    task::{Context, Poll, Waker},
-};
+use core::task::{Context, Poll};
 
-use skid_pipe::{AsyncChain, AsyncPipe, Chain, Pipe, Step};
+use skid_pipe::{AsyncChain, AsyncPipe, AsyncStep, Chain, Pipe, Step, TryAsyncPipe, TryAsyncStep};
 
-fn poll_to_completion<Output>(future: impl Future<Output = Output>) -> Output {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
+mod common;
 
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => continue,
-        }
-    }
-}
+use common::poll_to_completion;
 
 fn build_classifier() -> impl Chain<u16, Output = bool> {
     Pipe::new(|value: u16| value as f32 / 4095.0).then(|value: f32| value > 0.5)
@@ -60,4 +49,85 @@ fn async_builder_function_erases_the_concrete_pipeline_type() {
     let mut pipeline = build_async_doubler();
 
     assert_eq!(poll_to_completion(pipeline.run(4)), 10);
+}
+
+struct ReadyWiden;
+
+impl AsyncStep<u8> for ReadyWiden {
+    type Output = u16;
+    type Future<'a>
+        = core::future::Ready<u16>
+    where
+        Self: 'a;
+
+    fn call(&mut self, input: u8) -> Self::Future<'_> {
+        core::future::ready(u16::from(input))
+    }
+}
+
+struct TryReadyWiden;
+
+impl TryAsyncStep<u8, &'static str> for TryReadyWiden {
+    type Output = u16;
+    type Future<'a>
+        = core::future::Ready<Result<u16, &'static str>>
+    where
+        Self: 'a;
+
+    fn call(&mut self, input: u8) -> Self::Future<'_> {
+        core::future::ready(Ok(u16::from(input)))
+    }
+}
+
+struct BorrowingFuture<'a> {
+    calls: &'a mut u16,
+    input: u8,
+}
+
+impl Future for BorrowingFuture<'_> {
+    type Output = u16;
+
+    fn poll(self: core::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        *this.calls += 1;
+        Poll::Ready(u16::from(this.input) + *this.calls)
+    }
+}
+
+struct BorrowingWiden {
+    calls: u16,
+}
+
+impl AsyncStep<u8> for BorrowingWiden {
+    type Output = u16;
+    type Future<'a>
+        = BorrowingFuture<'a>
+    where
+        Self: 'a;
+
+    fn call(&mut self, input: u8) -> Self::Future<'_> {
+        BorrowingFuture {
+            calls: &mut self.calls,
+            input,
+        }
+    }
+}
+
+#[test]
+fn hand_written_async_step_implementations_expose_their_future_type() {
+    let mut pipeline = AsyncPipe::new(|value: u8| core::future::ready(value + 1)).then(ReadyWiden);
+    let mut try_pipeline =
+        TryAsyncPipe::new(|value: u8| core::future::ready(Ok::<_, &'static str>(value + 1)))
+            .try_then(TryReadyWiden);
+
+    assert_eq!(poll_to_completion(pipeline.run(4)), 5_u16);
+    assert_eq!(poll_to_completion(try_pipeline.run(4)), Ok(5_u16));
+}
+
+#[test]
+fn a_hand_written_stage_future_may_borrow_mutable_stage_state() {
+    let mut pipeline = AsyncPipe::new(BorrowingWiden { calls: 0 });
+
+    assert_eq!(poll_to_completion(pipeline.run(4)), 5);
+    assert_eq!(poll_to_completion(pipeline.run(4)), 6);
 }

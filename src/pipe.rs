@@ -15,7 +15,7 @@ pub struct Pipe<Head, Tail = End> {
 
 impl<Head> Pipe<Head> {
     /// Starts a pipeline with its first step.
-    #[inline]
+    #[inline(always)]
     pub const fn new(head: Head) -> Self {
         Self { head, tail: End }
     }
@@ -23,7 +23,7 @@ impl<Head> Pipe<Head> {
 
 impl<Head, Tail> Pipe<Head, Tail> {
     /// Appends the next step to this pipeline.
-    #[inline]
+    #[inline(always)]
     pub const fn then<Next>(self, next: Next) -> Pipe<Next, Self> {
         Pipe {
             head: next,
@@ -36,7 +36,7 @@ impl<Head, Tail> Pipe<Head, Tail> {
     /// The mutable receiver allows any stage to be an ordinary `FnMut` closure
     /// and retain state between runs. Pure functions and `Fn` closures work as
     /// `FnMut` stages too.
-    #[inline]
+    #[inline(always)]
     pub fn run<Input>(&mut self, input: Input) -> <Self as Chain<Input>>::Output
     where
         Self: Chain<Input>,
@@ -65,7 +65,7 @@ where
 {
     type Output = Output;
 
-    #[inline]
+    #[inline(always)]
     fn call(&mut self, input: Input) -> Self::Output {
         self(input)
     }
@@ -104,7 +104,7 @@ pub trait Chain<Input>: Sized {
 impl<Input> Chain<Input> for End {
     type Output = Input;
 
-    #[inline]
+    #[inline(always)]
     fn run(&mut self, input: Input) -> Self::Output {
         input
     }
@@ -117,7 +117,7 @@ where
 {
     type Output = Head::Output;
 
-    #[inline]
+    #[inline(always)]
     fn run(&mut self, input: Input) -> Self::Output {
         let intermediate = Chain::run(&mut self.tail, input);
         Step::call(&mut self.head, intermediate)

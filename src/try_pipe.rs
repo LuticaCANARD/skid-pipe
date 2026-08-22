@@ -98,10 +98,23 @@ impl<Input, Error> TryChain<Input, Error> for End {
     }
 }
 
-impl<Head, Tail, Input, Error> TryChain<Input, Error> for TryPipe<Head, Tail>
+impl<Head, Input, Error> TryChain<Input, Error> for TryPipe<Head, End>
 where
-    Tail: TryChain<Input, Error>,
-    Head: TryStep<Tail::Output, Error>,
+    Head: TryStep<Input, Error>,
+{
+    type Output = Head::Output;
+
+    #[inline]
+    fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        TryStep::call(&mut self.head, input)
+    }
+}
+
+impl<Head, TailHead, TailTail, Input, Error> TryChain<Input, Error>
+    for TryPipe<Head, TryPipe<TailHead, TailTail>>
+where
+    TryPipe<TailHead, TailTail>: TryChain<Input, Error>,
+    Head: TryStep<<TryPipe<TailHead, TailTail> as TryChain<Input, Error>>::Output, Error>,
 {
     type Output = Head::Output;
 

@@ -3,14 +3,14 @@
 > Reusable, state-capable, fully static computation pipelines for Rust `core`.
 
 `skid-pipe` turns a chain of ordinary Rust functions into a reusable value.
-Its shipped library uses only `core`:
+Its default core uses only `core`:
 
 - `no_std`
-- zero library dependencies
+- zero default library dependencies
 - zero allocation
 - static dispatch
 - no runtime or executor
-- no `unsafe`
+- safe public API; `unsafe` is isolated to async future pin projection
 - native, WebAssembly, and embedded-core compatible
 
 It is not an immediate-value pipe operator, a `Result`-only framework, or a
@@ -108,21 +108,29 @@ every stage. It adds no allocation or virtual call, but exact generated code
 still depends on the compiler, target, and stages. Long pipelines with many
 distinct type combinations can also increase compile time and binary size.
 
-The native Criterion benchmark compares equivalent three-stage direct calls
-with `Pipe`, `TryPipe`, and `AsyncPipe` composition. Its async comparison uses
-the same `core::future::Ready`-returning stages on both sides. Construction is
-outside the measured loop, matching a reusable pipeline's normal use:
+The native Criterion benchmark compares equivalent direct calls with `Pipe`,
+`TryPipe`, `AsyncPipe`, and `TryAsyncPipe` composition. Fallible cases cover
+different chain lengths and error positions, including first, middle, and last
+errors in a 100-stage chain. Async comparisons use the same
+`core::future::Ready`-returning stages on both sides. Construction is outside
+the measured loop, matching a reusable pipeline's normal use:
 
 ```sh
-cargo bench --bench composition
+cargo +1.86 bench --bench composition -- \
+  --warm-up-time 1 --measurement-time 2 --sample-size 50
 ```
 
 Criterion is a benchmark-only development dependency; the published library's
-normal dependency graph remains empty.
+default normal dependency graph remains empty. The opt-in `tokio` feature is
+not included in these measurements.
 
 Treat the resulting nanoseconds as machine-local evidence, not a portable
 performance promise. Flash size, stack use, and assembly require target-specific
 measurement before making embedded optimization claims.
+
+The checked-in [benchmark snapshot](BENCHMARKS.md) records the full direct
+comparison, including 100-stage runtime, future layout, and a Cortex-M code
+size probe. It intentionally reports the unfavorable long-async cases too.
 
 ## Examples
 
@@ -239,9 +247,122 @@ assert!(pipeline.run(12).await);
 ```
 
 The caller may use Tokio, Embassy, a browser/Wasm integration, or any other
-environment. `run` holds the mutable pipeline borrow until its future
-completes, so a stateful pipeline instance cannot run concurrently. The core
-crate does not depend on any executor.
+environment. Creating a run future is lazy: the first stage is not called until
+the future is polled. Construction is not free, though: the run future writes
+one pointer and one state tag per group of eight stages, so an unpolled run — or
+one that short-circuits on the first stage's error — still costs `O(stages / 8)`
+stores. `run` holds the mutable pipeline borrow until its future completes or is
+dropped, so a stateful pipeline instance cannot run concurrently. The default
+core crate does not depend on any executor.
+
+### Tokio feature
+
+Enable the optional integration when the application already uses Tokio:
+
+```toml
+[dependencies]
+skid-pipe = { version = "0.2", features = ["tokio"] }
+```
+
+The feature enables Tokio's minimal `rt` feature and exports two extension
+traits: `TokioAsyncChainExt` and `TokioTryAsyncChainExt`. They move a pipeline
+and one input into a Tokio task, making the required ownership boundary
+explicit. The default feature set remains `no_std`, dependency-free, and free
+of Tokio.
+
+For [`tokio::spawn`](https://docs.rs/tokio/latest/tokio/task/fn.spawn.html),
+import the extension trait and consume the pipeline with `spawn`:
+
+```rust,ignore
+use skid_pipe::{AsyncPipe, TokioAsyncChainExt};
+
+let task = AsyncPipe::new(fetch)
+    .then(classify)
+    .spawn(12);
+```
+
+`spawn` requires the pipeline, input, output, and concrete run future to meet
+Tokio's `Send + 'static` boundary. A run future created from a pipeline that
+stays on the caller's stack borrows that pipeline and therefore cannot itself
+be made `'static`.
+
+For a non-`Send` stage, use Tokio's
+[`LocalSet::spawn_local`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html#method.spawn_local)
+with the same ownership pattern:
+
+```rust,ignore
+use skid_pipe::{AsyncPipe, TokioAsyncChainExt};
+
+let result = local.run_until(async {
+    AsyncPipe::new(local_stage)
+        .then(classify)
+        .spawn_local(12)
+        .await
+}).await;
+```
+
+One stateful pipeline processes runs sequentially. To handle jobs concurrently,
+move a distinct pipeline value into each task, or keep one pipeline in a
+long-lived task and send jobs to that task. Aborting a task drops its active
+run future; already-polled `FnMut` state changes are not rolled back.
+
+`TryAsyncPipe` provides the same static composition for futures that resolve
+to `Result<T, E>`. It stops before calling any stage after the first error:
+
+```rust
+use skid_pipe::TryAsyncPipe;
+
+async fn fetch(value: u8) -> Result<u16, &'static str> {
+    Ok(u16::from(value))
+}
+
+async fn validate(value: u16) -> Result<bool, &'static str> {
+    if value == 0 { Err("empty") } else { Ok(value > 10) }
+}
+
+# async fn example() {
+let mut pipeline = TryAsyncPipe::new(fetch).try_then(validate);
+assert_eq!(pipeline.run(12).await, Ok(true));
+# }
+```
+
+Its returned future likewise keeps a mutable borrow until completion or drop.
+Dropping a pending run permits a later run, but state changes already made by
+polled `FnMut` stages are retained.
+
+## Long async chains and embedded stacks
+
+All four pipeline variants are compiled and executed with 100 stages on the
+declared Rust 1.86 MSRV without requiring callers to raise rustc's default
+recursion limit. Async chains use flat eight-stage internal state machines to
+keep compiler layout recursion bounded, and each machine borrows the
+sub-pipeline it drives as one pointer rather than one per stage.
+
+This is a supported compilation and behavior boundary, not a promise that a
+100-stage future fits every firmware task stack. Pipeline future size grows
+with the number of stages, captured state, intermediate values, and the
+largest active stage future. Measure the concrete target before deployment:
+
+```rust
+# use skid_pipe::AsyncPipe;
+let mut pipeline = AsyncPipe::new(|value: u8| core::future::ready(value + 1));
+let future = pipeline.run(1);
+let bytes = core::mem::size_of_val(&future);
+assert!(bytes > 0);
+```
+
+On a constrained executor task, prefer shorter pipelines with explicit await
+boundaries over one 100-stage future. This lets each phase's run future finish
+before the next is created and gives the linker and stack analysis smaller,
+more useful units to inspect.
+
+The synchronous paths contain no unsafe code. Async sequencing keeps only one
+active stage future in an internal union and uses isolated pin projection in
+`src/future.rs`; the crate denies unsafe code outside that module, and CI fails
+if any other file opts back in. The active union variant is tracked explicitly,
+dropped in place exactly once, and tested under Miri across pending,
+cancellation, short-circuit, and 100-stage paths.
+Callers never need unsafe code.
 
 ## API boundaries
 
@@ -257,11 +378,13 @@ fn build() -> impl Chain<u16, Output = bool> {
 }
 ```
 
-`Step`, `TryStep`, and `AsyncStep` are public and open to hand-written
-implementations for named stateful stages. The execution traits are `Sized`;
-the core deliberately offers no type-erased, boxed, or runtime-configured
-pipeline. That keeps every stage connection statically checked,
-allocation-free, and free of dynamic dispatch.
+`Step`, `TryStep`, `AsyncStep`, and `TryAsyncStep` are public and open to
+hand-written implementations for named stateful stages. Builder functions may
+return the corresponding `Chain`, `TryChain`, `AsyncChain`, or `TryAsyncChain`
+trait to hide their recursive concrete type. These execution traits are
+`Sized`; the core deliberately offers no type-erased, boxed, or
+runtime-configured pipeline. That keeps every stage connection statically
+checked, allocation-free, and free of dynamic dispatch.
 
 ## What this crate is not
 
@@ -269,6 +392,8 @@ allocation-free, and free of dynamic dispatch.
 
 - an HTTP middleware stack;
 - an async runtime or executor;
+- a retry, timeout, or authentication framework;
+- a global-state or dependency-injection container;
 - a parallel stream processor;
 - a persistent workflow engine;
 - a state-machine DSL;
@@ -281,8 +406,8 @@ ordinary procedural Rust is usually clearer.
 
 ## Platform validation
 
-CI checks the static core on stable Rust and the declared MSRV (Rust 1.86), including
-representative targets:
+CI checks the static core on stable Rust and the declared MSRV (Rust 1.86),
+including representative targets:
 
 - `wasm32-unknown-unknown`
 - `wasm32v1-none`
@@ -293,6 +418,23 @@ representative targets:
 The core stays ecosystem-neutral. Integrations that require a HAL, executor,
 logging framework, or model runtime belong in separate adapter crates.
 
+## Versioning and compatibility
+
+The minimum supported Rust version (MSRV) is Rust 1.86. CI checks both the MSRV
+and stable Rust. An MSRV increase is treated as a semver-minor change and is
+recorded in the [changelog](CHANGELOG.md).
+
+While the crate is below 1.0, a minor release may change public APIs. Patch
+releases are reserved for fixes, documentation, and compatible performance
+improvements; they do not intentionally break existing code. When practical,
+an API replacement is deprecated before removal. Any required migration and
+its replacement API are called out in the changelog for the release.
+
+The core compatibility boundary remains `no_std`, allocation-free, statically
+dispatched composition. HTTP clients, retry, timeout, authentication, and
+global state management belong to applications or separate transport/service
+layers.
+
 ## License
 
 Licensed under the [MIT License](LICENSE-MIT).
@@ -302,8 +444,11 @@ Licensed under the [MIT License](LICENSE-MIT).
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo bench --bench composition
+cargo test --features tokio
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo +1.86 bench --bench composition -- --warm-up-time 1 --measurement-time 2 --sample-size 50
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32v1-none
 cargo check --target thumbv6m-none-eabi
@@ -311,4 +456,5 @@ cargo check --target thumbv7em-none-eabihf
 cargo check --target riscv32imac-unknown-none-elf
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+cargo +nightly-2026-04-03 miri test --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
 ```

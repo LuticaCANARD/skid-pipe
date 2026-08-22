@@ -1,6 +1,6 @@
 [package]
 name = "skid-pipe"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Reusable, state-capable static computation pipelines for Rust core"
 license = "MIT"
@@ -15,8 +15,19 @@ rust-version = "1.86"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+tokio = ["dep:tokio"]
+
+[dependencies]
+tokio = { version = "1.53", default-features = false, features = ["rt"], optional = true }
+
 [dev-dependencies]
 criterion = "=0.8.2"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
 name = "composition"

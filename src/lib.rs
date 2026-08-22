@@ -1,11 +1,18 @@
 #![no_std]
-#![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 //! Portable, typed composition of ordinary Rust functions.
 //!
-//! `skid-pipe` is dependency-free and uses only [`core`]. It adds no allocator,
-//! dynamic dispatch, runtime, or executor requirement, so the same pipeline
-//! types work on native targets, WebAssembly, and `no_std` firmware.
+//! `skid-pipe`'s default feature set is dependency-free and uses only [`core`].
+//! It adds no allocator, dynamic dispatch, runtime, or executor requirement,
+//! so the same pipeline types work on native targets, WebAssembly, and
+//! `no_std` firmware. The opt-in `tokio` feature adds task-spawning adapters
+//! for Tokio applications without changing the default core.
+//! The public API is safe. Internal async futures isolate the pin projection
+//! needed to run long static chains without raising rustc's recursion limit;
+//! unsafe code is denied everywhere else in the crate.
 //!
 //! # Synchronous pipeline
 //!
@@ -33,6 +40,28 @@
 //!
 //! let mut pipeline = TryPipe::new(decode).try_then(classify);
 //! assert_eq!(pipeline.run(12), Ok(true));
+//! ```
+//!
+//! # Fallible asynchronous pipeline
+//!
+//! [`TryAsyncPipe`] composes asynchronous `Result`-returning functions and
+//! stops at the first error, without selecting an executor or allocating.
+//!
+//! ```
+//! use skid_pipe::TryAsyncPipe;
+//!
+//! async fn fetch(value: u8) -> Result<u16, &'static str> {
+//!     Ok(u16::from(value))
+//! }
+//!
+//! async fn validate(value: u16) -> Result<bool, &'static str> {
+//!     Ok(value > 10)
+//! }
+//!
+//! # async fn example() {
+//! let mut pipeline = TryAsyncPipe::new(fetch).try_then(validate);
+//! assert_eq!(pipeline.run(12).await, Ok(true));
+//! # }
 //! ```
 //!
 //! # Asynchronous pipeline
@@ -89,9 +118,10 @@
 //! (`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Builder functions can hide that
 //! name without changing the static pipeline:
 //!
-//! Return `impl Chain<Input, Output = O>` (or `impl TryChain` /
-//! `impl AsyncChain`) from a builder function. This remains zero-cost and
-//! preserves compile-time validation of every connection.
+//! Return `impl Chain<Input, Output = O>` (or `impl TryChain`,
+//! `impl AsyncChain`, or `impl TryAsyncChain`) from a builder function. This
+//! remains zero-cost and preserves compile-time validation of every
+//! connection.
 //!
 //! ```
 //! use skid_pipe::{Chain, Pipe};
@@ -136,11 +166,36 @@
 //! let mut pipeline = AsyncPipe::new(decode).then(needs_boolean);
 //! let _ = pipeline.run(1_u8);
 //! ```
+//!
+//! ```compile_fail
+//! use skid_pipe::TryAsyncPipe;
+//!
+//! async fn decode(_: u8) -> Result<u16, ()> { Ok(0) }
+//! async fn needs_boolean(_: bool) -> Result<u32, ()> { Ok(0) }
+//!
+//! let mut pipeline = TryAsyncPipe::new(decode).try_then(needs_boolean);
+//! let _ = pipeline.run(1_u8);
+//! ```
 
 mod async_pipe;
+#[allow(unsafe_code)]
+mod future;
 mod pipe;
+#[cfg(feature = "tokio")]
+mod tokio;
+mod try_async_pipe;
 mod try_pipe;
 
 pub use async_pipe::{AsyncChain, AsyncPipe, AsyncStep};
+#[doc(hidden)]
+pub use future::{
+    AsyncStart, FirstStageFuture, StartStep, ThenFuture, ThenOctFuture, ThenPairFuture,
+    ThenQuadFuture, TryStart, TryThenFuture, TryThenOctFuture, TryThenPairFuture,
+    TryThenQuadFuture,
+};
 pub use pipe::{Chain, End, Pipe, Step};
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use tokio::{TokioAsyncChainExt, TokioTryAsyncChainExt};
+pub use try_async_pipe::{TryAsyncChain, TryAsyncPipe, TryAsyncStep};
 pub use try_pipe::{TryChain, TryPipe, TryStep};

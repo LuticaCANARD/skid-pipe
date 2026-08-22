@@ -22,10 +22,35 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown,wasm32v1-none,thumbv6m-none-eabi,thumbv7em-none-eabihf,riscv32imac-unknown-none-elf
+      # Cargo.lock is not committed, so `--locked` is unavailable. Pin the only
+      # non-dev dependency on the MSRV leg instead: tokio has raised its MSRV
+      # within 1.x before, and an unpinned resolve would fail this leg on an
+      # unrelated PR. Bump together with the floor in Cargo.toml.
+      - name: Pin tokio on the MSRV toolchain
+        if: matrix.toolchain == '1.86'
+        run: cargo update -p tokio --precise 1.53.0
+      - name: Check unsafe code stays isolated to src/future.rs
+        run: |
+          pattern='allow(unsafe_code)\|allow(unsafe_op_in_unsafe_fn)'
+          # The `#[allow(unsafe_code)]` gating `mod future;` in src/lib.rs is the
+          # only exemption; src/future.rs itself is the sanctioned unsafe module.
+          outside=$(grep -rn --include='*.rs' "$pattern" src | grep -vc '^src/future\.rs:' || true)
+          gate=$(grep -A1 -h "$pattern" src/lib.rs | grep -c '^mod future;$' || true)
+          if [ "$outside" -ne 1 ] || [ "$gate" -ne 1 ]; then
+            echo "::error::unsafe code may only be allowed for src/future.rs"
+            grep -rn --include='*.rs' "$pattern" src
+            exit 1
+          fi
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
+      - run: cargo test --features tokio
       - run: cargo build
+      - name: Check public API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
       - run: rustdoc --test README.md --edition 2024 -L dependency=target/debug/deps --extern skid_pipe=target/debug/libskid_pipe.rlib
       - run: cargo check --target wasm32-unknown-unknown
       - run: cargo check --target wasm32v1-none
@@ -34,3 +59,18 @@ jobs:
       - run: cargo check --target riscv32imac-unknown-none-elf
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: miri
+      - run: >-
+          cargo miri test
+          --test async_pipeline
+          --test erasure
+          --test try_async_pipeline
+          --test hundred_stages
