@@ -18,6 +18,23 @@
 //! assert_eq!(pipeline.run(4), 10);
 //! ```
 //!
+//! # Fallible pipeline
+//!
+//! ```
+//! use skid_pipe::TryPipe;
+//!
+//! fn decode(value: u8) -> Result<u16, &'static str> {
+//!     if value == 0 { Err("empty") } else { Ok(u16::from(value)) }
+//! }
+//!
+//! fn classify(value: u16) -> Result<bool, &'static str> {
+//!     Ok(value > 10)
+//! }
+//!
+//! let mut pipeline = TryPipe::new(decode).try_then(classify);
+//! assert_eq!(pipeline.run(12), Ok(true));
+//! ```
+//!
 //! # Asynchronous pipeline
 //!
 //! [`AsyncPipe`] composes functions that return [`core::future::Future`]. It
@@ -51,6 +68,14 @@
 //! ```
 //!
 //! ```compile_fail
+//! use skid_pipe::TryPipe;
+//!
+//! let mut pipeline = TryPipe::new(|value: u8| Ok::<_, u8>(value))
+//!     .try_then(|value| Ok::<_, bool>(value));
+//! let _ = pipeline.run(1_u8);
+//! ```
+//!
+//! ```compile_fail
 //! use skid_pipe::Pipe;
 //!
 //! let mut pipeline = Pipe::new(|value: u8| value).then_branch(
@@ -73,6 +98,8 @@
 
 mod async_pipe;
 mod pipe;
+mod try_pipe;
 
 pub use async_pipe::AsyncPipe;
 pub use pipe::{Branch, End, Pipe};
+pub use try_pipe::TryPipe;

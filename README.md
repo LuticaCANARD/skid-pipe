@@ -35,6 +35,29 @@ Each stage may change the value type. The compiler checks that each concrete
 `run` call connects compatible input and output types. `run` takes `&mut self`
 so pure functions and stateful `FnMut` closures use the same API.
 
+## Fallible composition
+
+`TryPipe` composes standard `Result<T, E>` functions and stops at the first
+error. All stages use one error type; map individual domain errors to that type
+explicitly before composing them.
+
+```rust
+use skid_pipe::TryPipe;
+
+fn decode(value: u8) -> Result<u16, &'static str> {
+    if value == 0 { Err("empty") } else { Ok(u16::from(value)) }
+}
+
+fn classify(value: u16) -> Result<bool, &'static str> {
+    Ok(value > 10)
+}
+
+let mut pipeline = TryPipe::new(decode).try_then(classify);
+
+assert_eq!(pipeline.run(12), Ok(true));
+assert_eq!(pipeline.run(0), Err("empty"));
+```
+
 ## Static branching
 
 `then_branch` selects one sub-pipeline without allocating or dynamically
@@ -104,4 +127,5 @@ cargo check --target thumbv6m-none-eabi
 cargo check --target thumbv7em-none-eabihf
 cargo check --target riscv32imac-unknown-none-elf
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
+cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
 ```

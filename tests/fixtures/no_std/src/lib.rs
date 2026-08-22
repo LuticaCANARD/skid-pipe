@@ -1,6 +1,6 @@
 #![no_std]
 
-use skid_pipe::{AsyncPipe, Pipe};
+use skid_pipe::{AsyncPipe, Pipe, TryPipe};
 
 pub fn normalize_and_classify(sample: u16) -> bool {
     let mut pipeline = Pipe::new(|value: u16| value as f32 / 4095.0)
@@ -14,4 +14,11 @@ pub async fn increment_then_double(sample: u16) -> u16 {
         .then(|value| core::future::ready(value * 2));
 
     pipeline.run(sample).await
+}
+
+pub fn checked_increment_then_double(sample: u16) -> Result<u16, ()> {
+    let mut pipeline = TryPipe::new(|value: u16| value.checked_add(1).ok_or(()))
+        .try_then(|value: u16| value.checked_mul(2).ok_or(()));
+
+    pipeline.run(sample)
 }
