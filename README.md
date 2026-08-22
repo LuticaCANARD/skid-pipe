@@ -1,193 +1,253 @@
 # skid-pipe
 
-> A tiny `no_std`, allocation-free typed pipeline for composing ordinary Rust
-> computations from left to right.
+> Dependency-free typed function pipelines for `no_std`, with zero-cost
+> static composition and opt-in type erasure.
+
+`skid-pipe` turns a chain of ordinary Rust functions into a reusable value.
+Its default build uses only `core`:
 
 - `no_std`
 - zero dependencies
-- default build adds no allocation or dynamic dispatch
+- zero allocation
+- static dispatch
 - no runtime or executor
+- no `unsafe`
 - native, WebAssembly, and embedded-core compatible
-
-`skid-pipe` composes the computation itself into a reusable value. It does not
-know about HTTP, Tokio, Embassy, JavaScript, model runtimes, or hardware.
-
-## Synchronous composition
 
 ```rust
 use skid_pipe::Pipe;
 
-fn preprocess(value: u16) -> f32 {
-    value as f32 / 4095.0
-}
+let mut classify = Pipe::new(|raw: u16| raw as f32 / 4095.0)
+    .then(|ratio: f32| ratio > 0.5);
 
-fn classify(value: f32) -> bool {
-    value > 0.5
-}
-
-let mut pipeline = Pipe::new(preprocess).then(classify);
-
-assert!(pipeline.run(3000));
-assert!(!pipeline.run(100));
+assert!(classify.run(3000));
+assert!(!classify.run(100));
 ```
 
-Each stage may change the value type. The compiler checks that each concrete
-`run` call connects compatible input and output types. `run` takes `&mut self`
-so pure functions and stateful `FnMut` closures use the same API.
+Each stage may change the value type. Rust checks every adjacent connection:
 
-## Fallible composition
+```text
+u16 ──▶ f32 ──▶ bool
+```
 
-`TryPipe` composes standard `Result<T, E>` functions and stops at the first
-error. All stages use one error type; map individual domain errors to that type
-explicitly before composing them.
+## When it earns its keep
+
+Use plain Rust when a computation runs once:
+
+```rust
+# fn normalize(raw: u8) -> Result<u16, ()> { Ok(u16::from(raw)) }
+# fn classify(value: u16) -> Result<bool, ()> { Ok(value > 10) }
+# fn process(raw: u8) -> Result<bool, ()> {
+let normalized = normalize(raw)?;
+let classified = classify(normalized)?;
+# Ok(classified)
+# }
+```
+
+Use `skid-pipe` when the composed computation itself must become a value that
+you can:
+
+- build in one module and return as `impl Chain`;
+- run repeatedly while `FnMut` stages retain state;
+- borrow behind `DynChain` without allocation;
+- own behind `BoxedPipe` when type erasure is worth an allocation;
+- reuse across native, Wasm, and `no_std` targets.
+
+This crate does not replace Rust control flow. Branches remain ordinary
+`if`/`match` expressions inside stages.
+
+## Core model
+
+Appending a stage creates a new recursive type:
+
+```rust
+use skid_pipe::Pipe;
+
+fn f1(value: u8) -> u16 { u16::from(value) }
+fn f2(value: u16) -> u32 { u32::from(value) }
+fn f3(value: u32) -> bool { value > 10 }
+
+let _pipeline = Pipe::new(f1).then(f2).then(f3);
+```
+
+```text
+Pipe<F3, Pipe<F2, Pipe<F1, End>>>
+```
+
+The newest stage is stored at the head, but `run` evaluates the tail first.
+Values therefore flow left to right exactly as written:
+
+```text
+input ──▶ F1 ──▶ F2 ──▶ F3 ──▶ output
+```
+
+The default path allocates nothing and dynamically dispatches nothing.
+
+## Examples
+
+| Example | Demonstrates | Run |
+|---|---|---|
+| [`typed_sensor.rs`](examples/typed_sensor.rs) | Type-changing embedded-style processing | `cargo run --example typed_sensor` |
+| [`fallible_protocol.rs`](examples/fallible_protocol.rs) | First-error short-circuiting | `cargo run --example fallible_protocol` |
+| [`stateful_router.rs`](examples/stateful_router.rs) | Branching and state retained across runs | `cargo run --example stateful_router` |
+| [`runtime_registry.rs`](examples/runtime_registry.rs) | Configuration-selected stages | `cargo run --example runtime_registry --features dynamic` |
+
+## Fallible pipelines
+
+`TryPipe` composes ordinary `Result<T, E>` functions. It runs left to right
+and stops at the first error.
 
 ```rust
 use skid_pipe::TryPipe;
 
-fn decode(value: u8) -> Result<u16, &'static str> {
-    if value == 0 { Err("empty") } else { Ok(u16::from(value)) }
+#[derive(Debug, PartialEq)]
+enum Error {
+    Empty,
 }
 
-fn classify(value: u16) -> Result<bool, &'static str> {
+fn decode(value: u8) -> Result<u16, Error> {
+    if value == 0 {
+        Err(Error::Empty)
+    } else {
+        Ok(u16::from(value))
+    }
+}
+
+fn classify(value: u16) -> Result<bool, Error> {
     Ok(value > 10)
 }
 
 let mut pipeline = TryPipe::new(decode).try_then(classify);
 
 assert_eq!(pipeline.run(12), Ok(true));
-assert_eq!(pipeline.run(0), Err("empty"));
+assert_eq!(pipeline.run(0), Err(Error::Empty));
 ```
 
-## Branching
+All stages use one caller-selected error type. The crate does not synthesize,
+box, or convert errors.
 
-Branching is an ordinary `if` or `match` inside a stage, so the crate provides
-no combinator for it. `match` dispatches over any number of arms, and the
-compiler already requires every arm to produce the same type. Only the selected
-arm runs, and nothing is allocated or dynamically dispatched.
+## Stateful pipelines
+
+Stages implement `FnMut`, so a pipeline may retain state between completed
+runs without allocation:
 
 ```rust
 use skid_pipe::Pipe;
 
-let mut pipeline = Pipe::new(|value: i32| value)
-    .then(|value: i32| match value.signum() {
-        1 => value * 2,
-        -1 => -value,
-        _ => 0,
-    })
-    .then(|value: i32| value + 1);
-
-assert_eq!(pipeline.run(4), 9);
-assert_eq!(pipeline.run(-4), 5);
-```
-
-`AsyncPipe` branches the same way, awaiting only the selected arm. A stage
-closure is `FnMut`, so a branch that keeps state across runs holds that state
-in a `Cell` captured by shared reference; moving it into the returned future
-would make the closure `FnOnce` and it could no longer be a repeatable stage.
-
-```rust
-use core::cell::Cell;
-use skid_pipe::AsyncPipe;
-
-# async fn example() {
-let taken = Cell::new(0_u32);
-
-let mut pipeline = AsyncPipe::new(|value: i32| core::future::ready(value)).then(|value: i32| {
-    let taken = &taken;
-    async move {
-        taken.set(taken.get() + 1);
-        if value >= 0 { value * 2 } else { -value }
-    }
+let mut calls = 0_u32;
+let mut pipeline = Pipe::new(move |value: u16| {
+    calls += 1;
+    (value, calls)
 });
 
-assert_eq!(pipeline.run(4).await, 8);
-assert_eq!(taken.get(), 1);
-# }
+assert_eq!(pipeline.run(7), (7, 1));
+assert_eq!(pipeline.run(7), (7, 2));
 ```
 
-## Asynchronous composition
+The mutable pipeline borrow makes this sequencing explicit. Synchronization for
+state shared outside the pipeline remains the caller's responsibility.
+
+## Branching
+
+Branching is a normal stage. The selected arm may run its own typed sub-pipeline,
+and an enum can merge branches with different output types:
+
+```rust
+use skid_pipe::Pipe;
+
+enum Input {
+    Sensor(u16),
+    Command(&'static str),
+}
+
+enum Routed {
+    SensorScore(u32),
+    CommandAccepted(bool),
+}
+
+let mut sensor = Pipe::new(|raw: u16| u32::from(raw) * 2);
+let mut command = Pipe::new(|name: &'static str| name == "start");
+
+let mut pipeline = Pipe::new(|input: Input| input).then(move |input| match input {
+    Input::Sensor(raw) => Routed::SensorScore(sensor.run(raw)),
+    Input::Command(name) => Routed::CommandAccepted(command.run(name)),
+});
+```
+
+There is no branch DSL to learn and no branch object to allocate.
+
+## Async without an executor dependency
+
+`AsyncPipe` composes functions that return futures. It returns the composed
+future without boxing it, polling it, or selecting an executor.
 
 ```rust
 use skid_pipe::AsyncPipe;
 
-async fn fetch(value: u8) -> u8 {
-    value + 1
+async fn fetch(value: u8) -> u16 {
+    u16::from(value)
 }
 
-async fn transform(value: u8) -> u16 {
-    u16::from(value) * 2
+async fn classify(value: u16) -> bool {
+    value > 10
 }
 
 # async fn example() {
-let mut pipeline = AsyncPipe::new(fetch).then(transform);
-let output = pipeline.run(4).await;
-
-assert_eq!(output, 10);
+let mut pipeline = AsyncPipe::new(fetch).then(classify);
+assert!(pipeline.run(12).await);
 # }
 ```
 
-`AsyncPipe` returns a future but does not poll it. Use the executor owned by
-your application, whether that is a browser/Wasm integration, Embassy, Tokio,
-or another environment. The returned future holds the mutable pipeline borrow
-until it completes, so stateful stages cannot be run concurrently. The core
-crate does not depend on any executor.
+The caller may use Tokio, Embassy, a browser/Wasm integration, or any other
+environment. `AsyncChain` intentionally has no dyn-compatible variant because
+its methods return `impl Future`.
 
-## Type erasure
+## API boundaries and cost
 
-A pipeline's concrete type nests with every step
-(`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Three opt-in layers hide that name,
-ordered by cost; the default build keeps the first two, which stay
-allocation-free.
+A concrete pipeline type grows with every stage. Choose the cheapest boundary
+that satisfies the caller:
 
-Return `impl Chain` from a builder function (zero cost), or borrow any
-pipeline as `DynChain` / `DynTryChain` (no allocation, one indirect call per
-run):
+| Boundary | Allocation | Dispatch cost | Purpose |
+|---|---:|---:|---|
+| concrete `Pipe` | none | static | Maximum transparency and optimization |
+| `impl Chain` | none | static | Hide the concrete recursive type |
+| `DynChain` | none | one indirect call per run | Borrow one of several completed pipelines |
+| `BoxedPipe` | yes | indirect nested boundary | Own an erased pipeline |
+| `RuntimePipe` | one box per step | indirect call per step | Select stages and order from configuration |
+
+### Zero-cost opaque return
 
 ```rust
-use skid_pipe::{Chain, DynChain, Pipe};
+use skid_pipe::{Chain, Pipe};
 
 fn build() -> impl Chain<u16, Output = bool> {
-    Pipe::new(|value: u16| value as f32 / 4095.0).then(|value: f32| value > 0.5)
+    Pipe::new(|value: u16| value as f32 / 4095.0)
+        .then(|ratio: f32| ratio > 0.5)
 }
-
-let mut pipeline = build();
-let erased: DynChain<'_, u16, bool> = &mut pipeline;
-assert!(erased.run(3000));
 ```
 
-With the `alloc` feature (or `std`, which implies it), `BoxedPipe` and
-`BoxedTryPipe` own a fully erased pipeline. They can append a runtime-decided
-number of steps when the loop's input and output contract stays fixed:
+### Allocation-free borrowed erasure
 
 ```rust
-use skid_pipe::{BoxedPipe, Pipe};
+use skid_pipe::{DynChain, Pipe};
 
-let offsets = vec![1, 2, 3];
-let mut pipeline = BoxedPipe::new(Pipe::new(|value: i32| value));
+let mut double = Pipe::new(|value: i32| value * 2);
+let mut negate = Pipe::new(|value: i32| -value);
 
-for offset in offsets {
-    pipeline = pipeline.then(move |value| value + offset);
-}
+let selected: DynChain<'_, i32, i32> =
+    if true { &mut double } else { &mut negate };
 
-assert_eq!(pipeline.run(10), 16);
+assert_eq!(selected.run(4), 8);
 ```
 
-`Step`, `TryStep`, and `AsyncStep` are public and open to hand-written
-implementations for named stateful stages. `AsyncChain` supports only the
-`impl AsyncChain` boundary layer: its `run` returns `impl Future`, so the
-trait is not dyn-compatible and the crate offers no boxed asynchronous
-pipeline.
+`BoxedPipe` and `BoxedTryPipe` are available with the `alloc` feature.
+Each extension adds another erased wrapper, so they are ownership tools rather
+than heterogeneous workflow engines.
 
-Each boxed extension allocates a new erased wrapper. Running an extended boxed
-pipeline crosses the nested erased layers, so use it for ownership and limited
-runtime extension rather than as a heterogeneous workflow engine.
+## Dynamic composition is opt-in
 
-## Dynamic composition
-
-Enable `dynamic` when configuration selects heterogeneous logical stages at
-runtime. It implies `alloc` and provides `RuntimePipe<Value, Error>`. Every
-step receives and returns one caller-defined carrier type; an enum preserves
-the actual domain states without `Any` or downcasting.
+The `dynamic` feature is for the narrower case where configuration chooses
+the kinds, count, and order of registered stages. It implies `alloc`.
 
 ```rust
 use skid_pipe::RuntimePipe;
@@ -195,8 +255,7 @@ use skid_pipe::RuntimePipe;
 #[derive(Debug, PartialEq)]
 enum Value {
     Raw(u8),
-    Frame(u16),
-    Class(bool),
+    Decoded(u16),
 }
 
 #[derive(Debug, PartialEq)]
@@ -204,67 +263,59 @@ enum Error {
     UnexpectedValue,
 }
 
-let configured_steps = ["decode", "classify"];
 let mut pipeline = RuntimePipe::<Value, Error>::new();
+pipeline.push(|value| match value {
+    Value::Raw(raw) => Ok(Value::Decoded(u16::from(raw))),
+    _ => Err(Error::UnexpectedValue),
+});
 
-for step in configured_steps {
-    match step {
-        "decode" => {
-            pipeline.push(|value| match value {
-                Value::Raw(raw) => Ok(Value::Frame(u16::from(raw))),
-                _ => Err(Error::UnexpectedValue),
-            });
-        }
-        "classify" => {
-            pipeline.push(|value| match value {
-                Value::Frame(frame) => Ok(Value::Class(frame > 10)),
-                _ => Err(Error::UnexpectedValue),
-            });
-        }
-        _ => return,
-    }
-}
-
-assert_eq!(pipeline.run(Value::Raw(12)), Ok(Value::Class(true)));
+assert_eq!(
+    pipeline.run(Value::Raw(7)),
+    Ok(Value::Decoded(7)),
+);
 ```
 
-Runtime composition deliberately moves adjacency validation from the type
-system into the carrier and error types. It allocates once per registered step
-and dynamically dispatches every step. The default build remains fully static.
+Every runtime step has the common contract
+`Value -> Result<Value, Error>`. A caller-defined enum preserves domain states
+without `Any` or downcasting. In exchange, adjacency validation moves from
+compile time to runtime, and every step allocates and dynamically dispatches.
+
+Prefer the static core unless runtime configuration is an actual requirement.
+
+## What this crate is not
+
+`skid-pipe` is deliberately not:
+
+- an HTTP middleware stack;
+- an async runtime or executor;
+- a parallel stream processor;
+- a persistent workflow engine;
+- a state-machine DSL;
+- a plugin loader;
+- a replacement for straightforward local variables and `?`.
+
+If you need readiness, backpressure, timeout, retry, or network middleware, use
+a service abstraction such as Tower. If the computation is local and one-shot,
+ordinary procedural Rust is usually clearer.
 
 ## Features
 
-- `alloc` — `BoxedPipe` and `BoxedTryPipe`; requires only the `alloc` crate,
-  so it works on `no_std` targets with a heap allocator.
-- `dynamic` — `RuntimePipe` for configuration-selected steps; implies `alloc`.
-- `std` — currently just implies `alloc`.
+- default — dependency-free, allocation-free static pipelines using only
+  `core`;
+- `alloc` — `BoxedPipe` and `BoxedTryPipe`;
+- `dynamic` — `RuntimePipe`; implies `alloc`;
+- `std` — currently implies `alloc`.
 
-The default feature set is empty and the core stays dependency- and
-allocation-free.
+## Platform validation
 
-## Embedded integrations
+CI checks the static core and opt-in features on stable Rust and the declared
+MSRV, including representative targets:
 
-The core crate remains dependency-free for every target; there is intentionally
-no `embedded` feature that changes its allocation or runtime model. If a future
-integration needs `defmt`, a HAL, or another ecosystem dependency, it belongs
-in an opt-in adapter crate rather than in this core API.
+- `wasm32-unknown-unknown`
+- `wasm32v1-none`
+- `thumbv6m-none-eabi`
+- `thumbv7em-none-eabihf`
+- `riscv32imac-unknown-none-elf`
 
-## Validation
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo test --features dynamic
-cargo test --all-features
-cargo check --no-default-features --features dynamic --target wasm32v1-none
-cargo check --no-default-features --features dynamic --target thumbv6m-none-eabi
-cargo check --target wasm32-unknown-unknown
-cargo check --target wasm32v1-none
-cargo check --target thumbv6m-none-eabi
-cargo check --target thumbv7em-none-eabihf
-cargo check --target riscv32imac-unknown-none-elf
-cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
-cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
-```
+The core stays ecosystem-neutral. Integrations that require a HAL, executor,
+logging framework, or model runtime belong in separate adapter crates.
