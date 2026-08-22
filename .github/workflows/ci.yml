@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
           targets: wasm32-unknown-unknown,wasm32v1-none,thumbv6m-none-eabi,thumbv7em-none-eabihf,riscv32imac-unknown-none-elf
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
