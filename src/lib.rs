@@ -57,6 +57,32 @@
 //! # }
 //! ```
 //!
+//! # Branching
+//!
+//! Branching is an ordinary `if` or `match` inside a stage, so this crate
+//! adds no combinator for it. `match` dispatches over any number of arms,
+//! and the compiler already requires every arm to produce the same type.
+//!
+//! ```
+//! use skid_pipe::Pipe;
+//!
+//! let mut pipeline = Pipe::new(|value: i32| value)
+//!     .then(|value: i32| match value.signum() {
+//!         1 => value * 2,
+//!         -1 => -value,
+//!         _ => 0,
+//!     })
+//!     .then(|value: i32| value + 1);
+//!
+//! assert_eq!(pipeline.run(4), 9);
+//! assert_eq!(pipeline.run(-4), 5);
+//! ```
+//!
+//! The same holds for [`AsyncPipe`], where only the selected arm is awaited.
+//! A stage closure is [`FnMut`], so a branch that keeps state across runs
+//! holds it in a [`Cell`](core::cell::Cell) captured by shared reference
+//! rather than moving it into the returned future.
+//!
 //! # Type erasure
 //!
 //! A pipeline's concrete type nests with every step
@@ -106,17 +132,6 @@
 //! ```
 //!
 //! ```compile_fail
-//! use skid_pipe::Pipe;
-//!
-//! let mut pipeline = Pipe::new(|value: u8| value).then_branch(
-//!     |_| true,
-//!     Pipe::new(|value: u8| u16::from(value)),
-//!     Pipe::new(|value: u8| value > 0),
-//! );
-//! let _ = pipeline.run(1_u8);
-//! ```
-//!
-//! ```compile_fail
 //! use skid_pipe::AsyncPipe;
 //!
 //! async fn decode(_: u8) -> u16 { 0 }
@@ -138,5 +153,5 @@ mod try_pipe;
 pub use async_pipe::{AsyncChain, AsyncPipe, AsyncStep};
 #[cfg(feature = "alloc")]
 pub use boxed::{BoxedPipe, BoxedTryPipe};
-pub use pipe::{Branch, Chain, DynChain, End, Pipe, Step};
+pub use pipe::{Chain, DynChain, End, Pipe, Step};
 pub use try_pipe::{DynTryChain, TryChain, TryPipe, TryStep};

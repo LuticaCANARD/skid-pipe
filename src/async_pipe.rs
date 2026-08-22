@@ -1,6 +1,6 @@
 use core::future::Future;
 
-use crate::{Branch, End};
+use crate::End;
 
 /// A reusable, statically typed asynchronous function pipeline.
 ///
@@ -25,33 +25,6 @@ impl<Head, Tail> AsyncPipe<Head, Tail> {
     pub const fn then<Next>(self, next: Next) -> AsyncPipe<Next, Self> {
         AsyncPipe {
             head: next,
-            tail: self,
-        }
-    }
-
-    /// Appends two alternative asynchronous pipelines selected by a predicate.
-    ///
-    /// The predicate is evaluated synchronously from a borrow of the preceding
-    /// value. Only the selected branch is polled, and both branches must
-    /// resolve to the same output type when this pipeline is run.
-    #[inline]
-    pub const fn then_branch<Input, Predicate, WhenTrue, WhenFalse>(
-        self,
-        predicate: Predicate,
-        when_true: WhenTrue,
-        when_false: WhenFalse,
-    ) -> AsyncPipe<Branch<Predicate, WhenTrue, WhenFalse>, Self>
-    where
-        Predicate: FnMut(&Input) -> bool,
-        WhenTrue: AsyncChain<Input>,
-        WhenFalse: AsyncChain<Input, Output = <WhenTrue as AsyncChain<Input>>::Output>,
-    {
-        AsyncPipe {
-            head: Branch {
-                predicate,
-                when_true,
-                when_false,
-            },
             tail: self,
         }
     }
@@ -139,28 +112,5 @@ where
     async fn run(&mut self, input: Input) -> Self::Output {
         let intermediate = AsyncChain::run(&mut self.tail, input).await;
         AsyncStep::call(&mut self.head, intermediate).await
-    }
-}
-
-impl<Predicate, WhenTrue, WhenFalse, Input> AsyncStep<Input>
-    for Branch<Predicate, WhenTrue, WhenFalse>
-where
-    Predicate: FnMut(&Input) -> bool,
-    WhenTrue: AsyncChain<Input>,
-    WhenFalse: AsyncChain<Input, Output = <WhenTrue as AsyncChain<Input>>::Output>,
-{
-    type Output = <WhenTrue as AsyncChain<Input>>::Output;
-
-    #[inline]
-    fn call(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        let select_true = (self.predicate)(&input);
-
-        async move {
-            if select_true {
-                AsyncChain::run(&mut self.when_true, input).await
-            } else {
-                AsyncChain::run(&mut self.when_false, input).await
-            }
-        }
     }
 }
