@@ -292,6 +292,10 @@ representative targets:
 The core stays ecosystem-neutral. Integrations that require a HAL, executor,
 logging framework, or model runtime belong in separate adapter crates.
 
+## License
+
+Licensed under the [MIT License](LICENSE-MIT).
+
 ## Validation
 
 ```sh

@@ -1,9 +1,9 @@
 [package]
 name = "skid-pipe"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Reusable, state-capable static computation pipelines for Rust core"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 readme = "README.md"
 repository = "https://github.com/LuticaCANARD/skid-pipe"
 homepage = "https://github.com/LuticaCANARD/skid-pipe"
