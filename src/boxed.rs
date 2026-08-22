@@ -6,8 +6,9 @@ use crate::{Chain, Pipe, TryChain, TryPipe};
 ///
 /// Available with the `alloc` feature. The pipeline is named by its input and
 /// output types only, so it can be stored in fields, collected, and extended
-/// at runtime. Construction allocates once; each `run` costs one indirect
-/// call, while the stages captured inside remain statically dispatched.
+/// without exposing its concrete recursive type. Construction allocates once.
+/// Each extension allocates another erased wrapper, and running the result
+/// crosses those nested erased layers.
 ///
 /// ```
 /// use skid_pipe::{BoxedPipe, Pipe};
@@ -16,7 +17,8 @@ use crate::{Chain, Pipe, TryChain, TryPipe};
 /// assert_eq!(pipeline.run(4), 5);
 /// ```
 ///
-/// [`BoxedPipe::then`] enables composition whose shape is decided at runtime:
+/// [`BoxedPipe::then`] supports a runtime-decided number of steps when the
+/// loop's value type remains fixed:
 ///
 /// ```
 /// use skid_pipe::{BoxedPipe, Pipe};
@@ -48,8 +50,10 @@ impl<Input, Output> BoxedPipe<Input, Output> {
     /// Appends the next step, boxing the extended pipeline.
     ///
     /// Unlike [`Pipe::then`], this reallocates per call because the combined
-    /// pipeline is erased again; in exchange the number of steps can be
-    /// decided at runtime.
+    /// pipeline is erased again. Runtime loops can vary the number of appended
+    /// steps only while their variable's input and output types stay fixed;
+    /// use `RuntimePipe` with the `dynamic` feature for
+    /// configuration-selected heterogeneous logical stages.
     pub fn then<Next, NextOutput>(mut self, mut next: Next) -> BoxedPipe<Input, NextOutput>
     where
         Input: 'static,
@@ -77,7 +81,8 @@ impl<Input, Output> Chain<Input> for BoxedPipe<Input, Output> {
 ///
 /// Available with the `alloc` feature. The type parameters mirror `Result`:
 /// input, then success output, then error. The cost model matches
-/// [`BoxedPipe`]: one allocation to construct, one indirect call per `run`.
+/// [`BoxedPipe`]: construction allocates, and every extension adds another
+/// allocated erased layer.
 ///
 /// ```
 /// use skid_pipe::{BoxedTryPipe, TryPipe};
