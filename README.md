@@ -5,7 +5,7 @@
 
 - `no_std`
 - zero dependencies
-- no allocation or dynamic dispatch added by the crate
+- default build adds no allocation or dynamic dispatch
 - no runtime or executor
 - native, WebAssembly, and embedded-core compatible
 
@@ -156,7 +156,8 @@ assert!(erased.run(3000));
 ```
 
 With the `alloc` feature (or `std`, which implies it), `BoxedPipe` and
-`BoxedTryPipe` own a fully erased pipeline and compose it at runtime:
+`BoxedTryPipe` own a fully erased pipeline. They can append a runtime-decided
+number of steps when the loop's input and output contract stays fixed:
 
 ```rust
 use skid_pipe::{BoxedPipe, Pipe};
@@ -177,10 +178,65 @@ implementations for named stateful stages. `AsyncChain` supports only the
 trait is not dyn-compatible and the crate offers no boxed asynchronous
 pipeline.
 
+Each boxed extension allocates a new erased wrapper. Running an extended boxed
+pipeline crosses the nested erased layers, so use it for ownership and limited
+runtime extension rather than as a heterogeneous workflow engine.
+
+## Dynamic composition
+
+Enable `dynamic` when configuration selects heterogeneous logical stages at
+runtime. It implies `alloc` and provides `RuntimePipe<Value, Error>`. Every
+step receives and returns one caller-defined carrier type; an enum preserves
+the actual domain states without `Any` or downcasting.
+
+```rust
+use skid_pipe::RuntimePipe;
+
+#[derive(Debug, PartialEq)]
+enum Value {
+    Raw(u8),
+    Frame(u16),
+    Class(bool),
+}
+
+#[derive(Debug, PartialEq)]
+enum Error {
+    UnexpectedValue,
+}
+
+let configured_steps = ["decode", "classify"];
+let mut pipeline = RuntimePipe::<Value, Error>::new();
+
+for step in configured_steps {
+    match step {
+        "decode" => {
+            pipeline.push(|value| match value {
+                Value::Raw(raw) => Ok(Value::Frame(u16::from(raw))),
+                _ => Err(Error::UnexpectedValue),
+            });
+        }
+        "classify" => {
+            pipeline.push(|value| match value {
+                Value::Frame(frame) => Ok(Value::Class(frame > 10)),
+                _ => Err(Error::UnexpectedValue),
+            });
+        }
+        _ => return,
+    }
+}
+
+assert_eq!(pipeline.run(Value::Raw(12)), Ok(Value::Class(true)));
+```
+
+Runtime composition deliberately moves adjacency validation from the type
+system into the carrier and error types. It allocates once per registered step
+and dynamically dispatches every step. The default build remains fully static.
+
 ## Features
 
 - `alloc` — `BoxedPipe` and `BoxedTryPipe`; requires only the `alloc` crate,
   so it works on `no_std` targets with a heap allocator.
+- `dynamic` — `RuntimePipe` for configuration-selected steps; implies `alloc`.
 - `std` — currently just implies `alloc`.
 
 The default feature set is empty and the core stays dependency- and
@@ -200,7 +256,10 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo test --features dynamic
 cargo test --all-features
+cargo check --no-default-features --features dynamic --target wasm32v1-none
+cargo check --no-default-features --features dynamic --target thumbv6m-none-eabi
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32v1-none
 cargo check --target thumbv6m-none-eabi

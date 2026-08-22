@@ -25,9 +25,12 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
+      - run: cargo test --features dynamic
       - run: cargo test --all-features
       - run: cargo build --all-features
       - run: rustdoc --test README.md --edition 2024 -L dependency=target/debug/deps --extern skid_pipe=target/debug/libskid_pipe.rlib
+      - run: cargo check --no-default-features --features dynamic --target wasm32v1-none
+      - run: cargo check --no-default-features --features dynamic --target thumbv6m-none-eabi
       - run: cargo check --target wasm32-unknown-unknown
       - run: cargo check --target wasm32v1-none
       - run: cargo check --target thumbv6m-none-eabi
