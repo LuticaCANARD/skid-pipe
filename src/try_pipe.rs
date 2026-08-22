@@ -51,7 +51,7 @@ impl<Head, Tail> TryPipe<Head, Tail> {
 /// automatically, so callers normally pass plain functions or closures to
 /// [`TryPipe::try_then`]. Implementing `TryStep` by hand is supported for
 /// named stateful stages.
-pub trait TryStep<Input, Error> {
+pub trait TryStep<Input, Error>: Sized {
     /// The success value emitted by this stage.
     type Output;
 
@@ -77,36 +77,17 @@ where
 /// behind [`TryPipe::run`]. Like [`Chain`](crate::Chain), it is public so a
 /// fallible pipeline can be handled without naming its recursive concrete
 /// type: return `impl TryChain<Input, Error, Output = O>` from a builder
-/// function, or borrow the pipeline as [`DynTryChain`].
+/// function.
 ///
 /// External implementations are allowed. An implementation must run its
 /// stages from left to right and stop at the first error.
-pub trait TryChain<Input, Error> {
+pub trait TryChain<Input, Error>: Sized {
     /// The success value emitted by the completed pipeline.
     type Output;
 
     /// Runs this chain from left to right.
     fn run(&mut self, input: Input) -> Result<Self::Output, Error>;
 }
-
-/// A mutable borrow of a type-erased fallible pipeline.
-///
-/// The parameters mirror `Result`: input, then success output, then error.
-/// Like [`DynChain`](crate::DynChain) this adds no allocation and costs one
-/// indirect call per `run`.
-///
-/// ```
-/// use skid_pipe::{DynTryChain, TryPipe};
-///
-/// let mut pipeline = TryPipe::new(|value: u8| {
-///     if value == 0 { Err("empty") } else { Ok(u16::from(value)) }
-/// });
-///
-/// let erased: DynTryChain<'_, u8, u16, &'static str> = &mut pipeline;
-/// assert_eq!(erased.run(7), Ok(7));
-/// ```
-pub type DynTryChain<'a, Input, Output, Error> =
-    &'a mut dyn TryChain<Input, Error, Output = Output>;
 
 impl<Input, Error> TryChain<Input, Error> for End {
     type Output = Input;

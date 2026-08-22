@@ -3,10 +3,9 @@
 
 //! Portable, typed composition of ordinary Rust functions.
 //!
-//! `skid-pipe` is dependency-free. Its default feature set uses only [`core`]
-//! and adds no allocator, dynamic dispatch, runtime, or executor requirement,
-//! so the same pipeline types work on native targets, WebAssembly, and
-//! `no_std` firmware. Allocation-backed layers are explicitly opt-in.
+//! `skid-pipe` is dependency-free and uses only [`core`]. It adds no allocator,
+//! dynamic dispatch, runtime, or executor requirement, so the same pipeline
+//! types work on native targets, WebAssembly, and `no_std` firmware.
 //!
 //! # Synchronous pipeline
 //!
@@ -84,44 +83,31 @@
 //! holds it in a [`Cell`](core::cell::Cell) captured by shared reference
 //! rather than moving it into the returned future.
 //!
-//! # Type erasure
+//! # Type names
 //!
 //! A pipeline's concrete type nests with every step
-//! (`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Three opt-in layers hide that
-//! name, ordered by cost:
+//! (`Pipe<F3, Pipe<F2, Pipe<F1, End>>>`). Builder functions can hide that
+//! name without changing the static pipeline:
 //!
-//! - Return `impl Chain<Input, Output = O>` (or `impl TryChain` /
-//!   `impl AsyncChain`) from a builder function — zero cost.
-//! - Borrow any pipeline as [`DynChain`] / [`DynTryChain`] — no allocation,
-//!   one indirect call per run, works on every `no_std` target.
-//! - With the `alloc` feature (or `std`, which implies it), own a fully
-//!   erased pipeline as [`BoxedPipe`] / [`BoxedTryPipe`] and compose it at
-//!   runtime.
+//! Return `impl Chain<Input, Output = O>` (or `impl TryChain` /
+//! `impl AsyncChain`) from a builder function. This remains zero-cost and
+//! preserves compile-time validation of every connection.
 //!
 //! ```
-//! use skid_pipe::{Chain, DynChain, Pipe};
+//! use skid_pipe::{Chain, Pipe};
 //!
 //! fn build() -> impl Chain<u16, Output = bool> {
 //!     Pipe::new(|value: u16| value as f32 / 4095.0).then(|value: f32| value > 0.5)
 //! }
 //!
 //! let mut pipeline = build();
-//! let erased: DynChain<'_, u16, bool> = &mut pipeline;
-//! assert!(erased.run(3000));
+//! assert!(pipeline.run(3000));
 //! ```
 //!
-//! [`AsyncChain`] supports only the first layer: its `run` returns
-//! `impl Future`, so the trait is not dyn-compatible and no unboxed erasure
-//! exists for asynchronous pipelines.
+//! The crate deliberately has no type-erased or runtime-configured pipeline.
+//! [`AsyncChain`] also returns a concrete future, so it remains allocation-free.
 //!
-//! # Dynamic composition
-//!
-//! The opt-in `dynamic` feature provides [`RuntimePipe`] for configurations
-//! that select registered steps at runtime. It implies `alloc`; each step is
-//! boxed and dynamically dispatched. A caller-defined carrier enum represents
-//! heterogeneous logical values, and runtime connection failures use the
-//! caller's error type. The default build remains fully static and
-//! allocation-free.
+//! # Type checking
 //!
 //! ```compile_fail
 //! use skid_pipe::Pipe;
@@ -151,21 +137,10 @@
 //! let _ = pipeline.run(1_u8);
 //! ```
 
-#[cfg(feature = "alloc")]
-extern crate alloc;
-
 mod async_pipe;
-#[cfg(feature = "alloc")]
-mod boxed;
-#[cfg(feature = "dynamic")]
-mod dynamic;
 mod pipe;
 mod try_pipe;
 
 pub use async_pipe::{AsyncChain, AsyncPipe, AsyncStep};
-#[cfg(feature = "alloc")]
-pub use boxed::{BoxedPipe, BoxedTryPipe};
-#[cfg(feature = "dynamic")]
-pub use dynamic::{RuntimePipe, RuntimeStep};
-pub use pipe::{Chain, DynChain, End, Pipe, Step};
-pub use try_pipe::{DynTryChain, TryChain, TryPipe, TryStep};
+pub use pipe::{Chain, End, Pipe, Step};
+pub use try_pipe::{TryChain, TryPipe, TryStep};

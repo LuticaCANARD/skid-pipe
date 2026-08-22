@@ -10,9 +10,3 @@ rust-version = "1.85"
 
 [lib]
 path = "src/lib.rs"
-
-[features]
-default = []
-alloc = []
-dynamic = ["alloc"]
-std = ["alloc"]

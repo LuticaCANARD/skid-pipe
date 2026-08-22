@@ -1,10 +1,9 @@
 # skid-pipe
 
-> Dependency-free typed function pipelines for `no_std`, with zero-cost
-> static composition and opt-in type erasure.
+> Dependency-free, statically composed typed function pipelines for `no_std`.
 
 `skid-pipe` turns a chain of ordinary Rust functions into a reusable value.
-Its default build uses only `core`:
+It uses only `core`:
 
 - `no_std`
 - zero dependencies
@@ -49,8 +48,6 @@ you can:
 
 - build in one module and return as `impl Chain`;
 - run repeatedly while `FnMut` stages retain state;
-- borrow behind `DynChain` without allocation;
-- own behind `BoxedPipe` when type erasure is worth an allocation;
 - reuse across native, Wasm, and `no_std` targets.
 
 This crate does not replace Rust control flow. Branches remain ordinary
@@ -81,7 +78,7 @@ Values therefore flow left to right exactly as written:
 input ──▶ F1 ──▶ F2 ──▶ F3 ──▶ output
 ```
 
-The default path allocates nothing and dynamically dispatches nothing.
+The core path allocates nothing and uses no dynamic dispatch.
 
 ## Examples
 
@@ -90,7 +87,6 @@ The default path allocates nothing and dynamically dispatches nothing.
 | [`typed_sensor.rs`](examples/typed_sensor.rs) | Type-changing embedded-style processing | `cargo run --example typed_sensor` |
 | [`fallible_protocol.rs`](examples/fallible_protocol.rs) | First-error short-circuiting | `cargo run --example fallible_protocol` |
 | [`stateful_router.rs`](examples/stateful_router.rs) | Branching and state retained across runs | `cargo run --example stateful_router` |
-| [`runtime_registry.rs`](examples/runtime_registry.rs) | Configuration-selected stages | `cargo run --example runtime_registry --features dynamic` |
 
 ## Fallible pipelines
 
@@ -199,23 +195,14 @@ assert!(pipeline.run(12).await);
 ```
 
 The caller may use Tokio, Embassy, a browser/Wasm integration, or any other
-environment. `AsyncChain` intentionally has no dyn-compatible variant because
-its methods return `impl Future`.
+environment. `run` holds the mutable pipeline borrow until its future
+completes, so a stateful pipeline instance cannot run concurrently. The core
+crate does not depend on any executor.
 
-## API boundaries and cost
+## API boundaries
 
-A concrete pipeline type grows with every stage. Choose the cheapest boundary
-that satisfies the caller:
-
-| Boundary | Allocation | Dispatch cost | Purpose |
-|---|---:|---:|---|
-| concrete `Pipe` | none | static | Maximum transparency and optimization |
-| `impl Chain` | none | static | Hide the concrete recursive type |
-| `DynChain` | none | one indirect call per run | Borrow one of several completed pipelines |
-| `BoxedPipe` | yes | indirect nested boundary | Own an erased pipeline |
-| `RuntimePipe` | one box per step | indirect call per step | Select stages and order from configuration |
-
-### Zero-cost opaque return
+A concrete pipeline type grows with every stage. Return an opaque static trait
+from a builder function when callers should not name that recursive type:
 
 ```rust
 use skid_pipe::{Chain, Pipe};
@@ -226,61 +213,11 @@ fn build() -> impl Chain<u16, Output = bool> {
 }
 ```
 
-### Allocation-free borrowed erasure
-
-```rust
-use skid_pipe::{DynChain, Pipe};
-
-let mut double = Pipe::new(|value: i32| value * 2);
-let mut negate = Pipe::new(|value: i32| -value);
-
-let selected: DynChain<'_, i32, i32> =
-    if true { &mut double } else { &mut negate };
-
-assert_eq!(selected.run(4), 8);
-```
-
-`BoxedPipe` and `BoxedTryPipe` are available with the `alloc` feature.
-Each extension adds another erased wrapper, so they are ownership tools rather
-than heterogeneous workflow engines.
-
-## Dynamic composition is opt-in
-
-The `dynamic` feature is for the narrower case where configuration chooses
-the kinds, count, and order of registered stages. It implies `alloc`.
-
-```rust
-use skid_pipe::RuntimePipe;
-
-#[derive(Debug, PartialEq)]
-enum Value {
-    Raw(u8),
-    Decoded(u16),
-}
-
-#[derive(Debug, PartialEq)]
-enum Error {
-    UnexpectedValue,
-}
-
-let mut pipeline = RuntimePipe::<Value, Error>::new();
-pipeline.push(|value| match value {
-    Value::Raw(raw) => Ok(Value::Decoded(u16::from(raw))),
-    _ => Err(Error::UnexpectedValue),
-});
-
-assert_eq!(
-    pipeline.run(Value::Raw(7)),
-    Ok(Value::Decoded(7)),
-);
-```
-
-Every runtime step has the common contract
-`Value -> Result<Value, Error>`. A caller-defined enum preserves domain states
-without `Any` or downcasting. In exchange, adjacency validation moves from
-compile time to runtime, and every step allocates and dynamically dispatches.
-
-Prefer the static core unless runtime configuration is an actual requirement.
+`Step`, `TryStep`, and `AsyncStep` are public and open to hand-written
+implementations for named stateful stages. The execution traits are `Sized`;
+the core deliberately offers no type-erased, boxed, or runtime-configured
+pipeline. That keeps every stage connection statically checked,
+allocation-free, and free of dynamic dispatch.
 
 ## What this crate is not
 
@@ -298,18 +235,10 @@ If you need readiness, backpressure, timeout, retry, or network middleware, use
 a service abstraction such as Tower. If the computation is local and one-shot,
 ordinary procedural Rust is usually clearer.
 
-## Features
-
-- default — dependency-free, allocation-free static pipelines using only
-  `core`;
-- `alloc` — `BoxedPipe` and `BoxedTryPipe`;
-- `dynamic` — `RuntimePipe`; implies `alloc`;
-- `std` — currently implies `alloc`.
-
 ## Platform validation
 
-CI checks the static core and opt-in features on stable Rust and the declared
-MSRV, including representative targets:
+CI checks the static core on stable Rust and the declared MSRV, including
+representative targets:
 
 - `wasm32-unknown-unknown`
 - `wasm32v1-none`
@@ -319,3 +248,18 @@ MSRV, including representative targets:
 
 The core stays ecosystem-neutral. Integrations that require a HAL, executor,
 logging framework, or model runtime belong in separate adapter crates.
+
+## Validation
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo check --target wasm32-unknown-unknown
+cargo check --target wasm32v1-none
+cargo check --target thumbv6m-none-eabi
+cargo check --target thumbv7em-none-eabihf
+cargo check --target riscv32imac-unknown-none-elf
+cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
+cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+```

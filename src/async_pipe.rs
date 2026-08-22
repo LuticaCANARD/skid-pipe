@@ -51,7 +51,7 @@ impl<Head, Tail> AsyncPipe<Head, Tail> {
 /// automatically, so callers normally pass them straight to
 /// [`AsyncPipe::then`]. Implementing `AsyncStep` by hand is supported for
 /// named stateful stages.
-pub trait AsyncStep<Input> {
+pub trait AsyncStep<Input>: Sized {
     /// The value emitted when the stage future resolves.
     type Output;
 
@@ -79,12 +79,10 @@ where
 /// functions can return `impl AsyncChain<Input, Output = O>` and hide the
 /// recursive concrete pipeline type at zero cost.
 ///
-/// Unlike [`Chain`](crate::Chain), this trait is **not dyn-compatible**:
-/// `run` returns `impl Future`, so there is no `&mut dyn AsyncChain`
-/// counterpart to [`DynChain`](crate::DynChain). Erasing an asynchronous
-/// pipeline requires boxing each returned future, which this crate does not
-/// do; use `impl AsyncChain` at API boundaries instead.
-pub trait AsyncChain<Input> {
+/// `run` returns `impl Future`, keeping the future concrete and
+/// allocation-free. Use `impl AsyncChain` at API boundaries to hide a
+/// pipeline's recursive concrete type.
+pub trait AsyncChain<Input>: Sized {
     /// The value emitted when this chain's future resolves.
     type Output;
 
