@@ -13,6 +13,16 @@ GAT migration. No 0.2.0 release is implied until this section is dated.
 
 ### Added
 
+- Added the opt-in `lazy-construction` feature. Each link future then parks its
+  input and builds its tail chain's future on its own first poll, so creating a
+  run future is one layer's work regardless of chain length and one dropped
+  before its first poll is `O(1)`. Creating a 100-stage run future drops from
+  9.7967 ns to 1.2361 ns; the work moves into `poll`, where the extra state per
+  layer costs more than it saved, so the 100-stage first error regresses 19.8%
+  and the three-stage success rows 10.2% and 4.0%. It is off by default because
+  the default build optimizes end-to-end latency. The public API, the run
+  future's 240-byte layout, and the guarantee that no stage runs before the
+  first poll are identical either way.
 - Added `TryAsyncPipe` for statically composing asynchronous
   `Result<T, E>` stages with first-error short-circuiting.
 - Added the opt-in `tokio` feature with `spawn` and `spawn_local` extension

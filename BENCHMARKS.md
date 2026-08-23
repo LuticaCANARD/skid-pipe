@@ -156,8 +156,9 @@ firmware image.
 ## Rejected optimizations
 
 Three changes aimed at the two `TryAsyncPipe` rows above were implemented and
-measured against this snapshot's machine. None landed. They are recorded here
-so the same ground is not retried from the same reasoning.
+measured against this snapshot's machine. Two are recorded here so the same
+ground is not retried from the same reasoning; the third became the optional
+`lazy-construction` feature described after them.
 
 The `benches/diagnose.rs` groups split those rows into the costs behind them:
 creating a run future without polling it, an infallible and a fallible pipeline
@@ -196,20 +197,49 @@ every row moved by at most 1.7%, and the `first_error_depth/direct` control,
 which contains no pipeline code, moved 1.7% in the same run. LLVM was already
 forwarding the stores.
 
-**Lazy tail construction.** Each machine's `new` builds its tail chain's future
-immediately, so creating a 100-stage run future costs 9.7967 ns before any
-stage runs. Parking the input in the slot union instead, behind a new `Input`
-state, and building the tail on the first poll cuts that to 1.2431 ns, an 87.6%
-reduction, and makes a run future that is dropped before its first poll O(1).
-The work is not removed, only moved: it lands in `poll`, where one extra state
-per layer costs more than it saved. The 100-stage first error regressed 19.8%,
-the 10-stage 14.4%, the 3-stage 9.0%, and the same-shape success rows 11.6%
-(infallible) and 3.8% (fallible), all at p = 0.00. This is a trade, not a
-failure — it is the right change for a workload that creates and cancels run
-futures — but it is a loss on end-to-end latency, which is what these rows
-track.
+Two of the three were predicted to help from reading the code and did not.
+Treat the per-layer costs above as measured, and anything about why they are
+what they are as a hypothesis until a benchmark says otherwise.
 
-Two of the three were predicted to help from reading the code and did not. The
-one that did exactly what it was designed to do still lost overall. Treat the
-per-layer costs above as measured, and anything about why they are what they
-are as a hypothesis until a benchmark says otherwise.
+The third is not rejected but optional; it is described below.
+
+## The `lazy-construction` feature
+
+Each machine's `new` builds its tail chain's future immediately, so creating a
+100-stage run future costs 9.7967 ns before any stage runs. The
+`lazy-construction` feature parks the input in the slot union instead, behind
+an `Input` state the feature adds, and builds the tail on the first poll.
+
+| | Default | `lazy-construction` | Change |
+|---|---:|---:|---:|
+| Create a 100-stage run future | 9.7967 ns | 1.2361 ns | −87.4% |
+| Create a 100-stage `AsyncPipe` one | 9.8854 ns | 1.2199 ns | −87.7% |
+| Create a 3-stage one | 1.8673 ns | 1.2402 ns | −33.6% |
+| 100-stage first error | 33.559 ns | 40.198 ns | +19.8% |
+| 10-stage first error | 19.982 ns | 23.052 ns | +15.4% |
+| 3-stage first error | 19.229 ns | 21.041 ns | +9.4% |
+| 3-stage success, `AsyncPipe` | 23.777 ns | 26.197 ns | +10.2% |
+| 3-stage success, `TryAsyncPipe` | 43.364 ns | 45.105 ns | +4.0% |
+
+Both columns are Criterion point estimates from the same pair of runs. Every
+row's confidence intervals are disjoint between the two columns, while those of
+the `first_error_depth/direct` control, which contains no pipeline code,
+overlap ([13.098, 13.291] ns against [13.045, 13.223] ns). The deltas are the
+feature, not run-to-run drift.
+
+Creating a run future becomes one layer's work regardless of chain length, and
+one dropped before its first poll becomes O(1). The work is not removed, only
+moved: it lands in `poll`, where one extra state per layer costs more than it
+saved. So the feature is off by default — the default build optimizes
+end-to-end latency — and is worth enabling only for a workload that creates run
+futures it may never poll.
+
+The run future's layout is identical either way. The slot union already had to
+be at least as wide as `Input`, because the tail future bottoms out in a
+`FirstStageFuture` that holds it, so the added member costs no bytes: the
+100-stage async and try-async futures measure 240 B on x86_64 under both
+configurations. The public API and the guarantee that no stage runs before the
+first poll are unchanged.
+
+The change that did exactly what it was designed to do still lost on latency.
+That is why it is a feature rather than a default.

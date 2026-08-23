@@ -255,6 +255,31 @@ stores. `run` holds the mutable pipeline borrow until its future completes or is
 dropped, so a stateful pipeline instance cannot run concurrently. The default
 core crate does not depend on any executor.
 
+### Lazy construction feature
+
+`skid-pipe` builds a run future's whole nest of link futures when `run` is
+called. That is the faster arrangement end to end, and it is the default. A
+workload that creates run futures it may drop before ever polling them — a
+select arm that loses, a task cancelled at its first await point — pays that
+construction for nothing. For those, enable:
+
+```toml
+[dependencies]
+skid-pipe = { version = "0.2", features = ["lazy-construction"] }
+```
+
+Each link future then parks its input and builds its tail on the first poll,
+so creating one is a single layer's work no matter how long the chain is. The
+public API, the run future's size, and the guarantee that no stage runs before
+the first poll are all unchanged; only where the nest is built moves.
+
+It is a trade, not a free win. On the snapshot machine, creating a 100-stage
+run future drops from 9.7967 ns to 1.2361 ns, while the 100-stage first-error
+run regresses 19.8% and the three-stage success rows 10.2% (`AsyncPipe`) and
+4.0% (`TryAsyncPipe`). Measure your own workload before enabling it; if your
+run futures are always polled to completion, leave it off. See
+[BENCHMARKS.md](BENCHMARKS.md) for the full numbers.
+
 ### Tokio feature
 
 Enable the optional integration when the application already uses Tokio:
@@ -447,6 +472,7 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --features tokio
+cargo test --features lazy-construction
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo +1.86 bench --bench composition -- --warm-up-time 1 --measurement-time 2 --sample-size 50
 cargo check --target wasm32-unknown-unknown
@@ -456,5 +482,7 @@ cargo check --target thumbv7em-none-eabihf
 cargo check --target riscv32imac-unknown-none-elf
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+cargo check --target thumbv6m-none-eabi --features lazy-construction
 cargo +nightly-2026-04-03 miri test --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
+cargo +nightly-2026-04-03 miri test --features lazy-construction --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
 ```

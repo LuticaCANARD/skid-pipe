@@ -46,6 +46,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
       - run: cargo test --features tokio
+      - run: cargo test --features lazy-construction
       - run: cargo build
       - name: Check public API documentation
         env:
@@ -59,6 +60,7 @@ jobs:
       - run: cargo check --target riscv32imac-unknown-none-elf
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+      - run: cargo check --target thumbv6m-none-eabi --features lazy-construction
 
   miri:
     runs-on: ubuntu-latest
@@ -70,6 +72,14 @@ jobs:
           components: miri
       - run: >-
           cargo miri test
+          --test async_pipeline
+          --test erasure
+          --test try_async_pipeline
+          --test hundred_stages
+      # `lazy-construction` replaces every machine's `new` and adds a state to
+      # its poll and drop, so it needs its own pin-projection coverage.
+      - run: >-
+          cargo miri test --features lazy-construction
           --test async_pipeline
           --test erasure
           --test try_async_pipeline

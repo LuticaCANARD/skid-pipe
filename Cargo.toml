@@ -17,6 +17,13 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Builds each link future's tail on its first poll instead of when the run
+# future is created. Creating a 100-stage run future drops from 9.7967 ns to
+# 1.2361 ns, and one dropped before its first poll becomes O(1); the work moves
+# into `poll`, where the extra state per layer costs more than it saved. See
+# "Rejected optimizations" in BENCHMARKS.md for the full trade. Off by default:
+# the default build optimizes end-to-end latency.
+lazy-construction = []
 tokio = ["dep:tokio"]
 
 [dependencies]
