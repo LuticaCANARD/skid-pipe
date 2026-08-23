@@ -55,7 +55,10 @@ GAT migration. No 0.2.0 release is implied until this section is dated.
   ten, the gap growing because a combinator chain is consumed by one `await`
   and so is rebuilt per run. First-error short-circuiting, this crate's weakest
   result against direct calls, costs `and_then` more on the same shape. A plain
-  `async fn` beats both crates in every group.
+  `async fn` beats both crates in every group, and the section says what the
+  crate offers instead of speed, which is composition as a value rather than
+  state retention: an async stage capturing state by move accumulates nothing,
+  here as in a plain async closure.
 
 ### Changed
 

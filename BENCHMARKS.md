@@ -291,9 +291,19 @@ of it.
 The baseline wins everywhere, and that is the honest headline. A plain
 `async fn` is faster than both crates in all five groups, by 24% to 85% against
 `skid-pipe`. What `skid-pipe` sells against it is a composed computation that is
-a value — returnable as `impl Chain`, re-runnable with `FnMut` stages that keep
-state, typed at every connection — not speed. Reach for the `async fn` when the
-chain is short and lives in one place.
+a value: built in one place and returned as `impl AsyncChain<Input, Output = O>`,
+assembled conditionally, and typed at every connection. Not speed.
+
+It does not sell state retention here, and the arms above should not be read as
+if it did. `AsyncStep`'s blanket implementation maps a stage to
+`type Future<'a> = Fut`, which does not borrow the closure, so an async stage
+that captures state by move gets a copy per call and silently accumulates
+nothing — the same trap a plain async closure has, and the reason the crate
+docs route async state through a `Cell` captured by shared reference. That
+`Cell` works just as well without this crate. Only the synchronous `Pipe` and
+`TryPipe` keep `FnMut` state across runs on their own.
+
+Reach for the `async fn` when the chain is short and lives in one place.
 
 Ten stages is the ceiling here because a combinator chain nests its type once
 per stage, which is the same wall that made this crate flatten its own chains in
