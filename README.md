@@ -274,9 +274,9 @@ public API, the run future's size, and the guarantee that no stage runs before
 the first poll are all unchanged; only where the nest is built moves.
 
 It is a trade, not a free win. On the snapshot machine, creating a 100-stage
-run future drops from 9.7967 ns to 1.2361 ns, while the 100-stage first-error
-run regresses 19.8% and the three-stage success rows 10.2% (`AsyncPipe`) and
-4.0% (`TryAsyncPipe`). Measure your own workload before enabling it; if your
+run future drops from 9.8489 ns to 1.2309 ns, while the 100-stage first-error
+run regresses 19.6% and the three-stage success rows 9.2% (`AsyncPipe`) and
+1.6% (`TryAsyncPipe`). Measure your own workload before enabling it; if your
 run futures are always polled to completion, leave it off. See
 [BENCHMARKS.md](BENCHMARKS.md) for the full numbers.
 

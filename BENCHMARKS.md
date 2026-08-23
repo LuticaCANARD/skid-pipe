@@ -206,26 +206,34 @@ The third is not rejected but optional; it is described below.
 ## The `lazy-construction` feature
 
 Each machine's `new` builds its tail chain's future immediately, so creating a
-100-stage run future costs 9.7967 ns before any stage runs. The
+100-stage run future costs 9.8489 ns before any stage runs. The
 `lazy-construction` feature parks the input in the slot union instead, behind
 an `Input` state the feature adds, and builds the tail on the first poll.
 
 | | Default | `lazy-construction` | Change |
 |---|---:|---:|---:|
-| Create a 100-stage run future | 9.7967 ns | 1.2361 ns | −87.4% |
-| Create a 100-stage `AsyncPipe` one | 9.8854 ns | 1.2199 ns | −87.7% |
-| Create a 3-stage one | 1.8673 ns | 1.2402 ns | −33.6% |
-| 100-stage first error | 33.559 ns | 40.198 ns | +19.8% |
-| 10-stage first error | 19.982 ns | 23.052 ns | +15.4% |
-| 3-stage first error | 19.229 ns | 21.041 ns | +9.4% |
-| 3-stage success, `AsyncPipe` | 23.777 ns | 26.197 ns | +10.2% |
-| 3-stage success, `TryAsyncPipe` | 43.364 ns | 45.105 ns | +4.0% |
+| Create a 100-stage `TryAsyncPipe` run future | 9.8489 ns | 1.2309 ns | −87.5% |
+| Create a 100-stage `AsyncPipe` one | 9.8516 ns | 1.2182 ns | −87.6% |
+| Create a 3-stage one | 1.8354 ns | 1.2286 ns | −33.1% |
+| 100-stage first error | 34.084 ns | 40.758 ns | +19.6% |
+| 10-stage first error | 20.005 ns | 25.187 ns | +25.9% |
+| 3-stage first error | 20.005 ns | 21.092 ns | +5.4% |
+| 3-stage success, `AsyncPipe` | 23.737 ns | 25.925 ns | +9.2% |
+| 3-stage success, `TryAsyncPipe` | 44.563 ns | 45.269 ns | +1.6% |
 
-Both columns are Criterion point estimates from the same pair of runs. Every
-row's confidence intervals are disjoint between the two columns, while those of
-the `first_error_depth/direct` control, which contains no pipeline code,
-overlap ([13.098, 13.291] ns against [13.045, 13.223] ns). The deltas are the
-feature, not run-to-run drift.
+Both columns come from the same commit and the same session, with only the
+feature flag differing. Every row's confidence intervals are disjoint between
+the columns, while those of the `first_error_depth/direct` control, which
+contains no pipeline code, sit on top of each other ([12.896, 13.049] ns
+against [12.925, 13.034] ns). The deltas are the feature.
+
+Their magnitudes are less stable than those intervals suggest. An earlier
+run of the same pair put the 10-stage first error at +15.4% rather than
++25.9%, and the 3-stage one at +9.4% rather than +5.4%. Between-run drift on
+this machine exceeds within-run precision on the shorter rows, so read the
+direction and the order of magnitude, not the second digit. The creation rows
+and the 100-stage first error reproduced across both runs to within a few
+tenths of a percent.
 
 Creating a run future becomes one layer's work regardless of chain length, and
 one dropped before its first poll becomes O(1). The work is not removed, only
