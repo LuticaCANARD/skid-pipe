@@ -61,7 +61,10 @@ shape, the fallible one costs about 20 percentage points more, not 110.
 | `TryAsyncPipe`, last error | 695.91 ns | 712.8 ns | +2.43% |
 
 The first-error async result is the one case where a long `TryAsyncPipe` chain
-still pays a fixed cost no direct call has. Creating the run future writes one
+still pays a fixed cost no direct call has. That cost belongs to static async
+composition rather than to this crate in particular: measured on the same stage
+shape, `futures`' `and_then` pays more of it. See "Against the `futures`
+combinators" below. Creating the run future writes one
 pointer and one state tag per group of eight stages, and the first stage's error
 is then propagated back out through every one of those groups in the same poll.
 No later stage is called. It is far cheaper than it was — the same row measured
@@ -251,3 +254,54 @@ first poll are unchanged.
 
 The change that did exactly what it was designed to do still lost on latency.
 That is why it is a feature rather than a default.
+
+## Against the `futures` combinators
+
+`benches/vs_futures.rs` puts three arms on identical stage bodies, payloads and
+`Ready` futures. `skid_pipe` builds its pipeline once outside the loop and calls
+`run` inside it. `futures_then` and `futures_and_then` rebuild their chain every
+iteration, because one `await` consumes it — that is what composing futures
+rather than functions costs a caller who runs the same computation twice.
+`direct_async_fn` is a plain `async fn`: reusable, composing the same stages,
+needing no dependency at all, and so the baseline both crates have to beat.
+
+| Group | `direct_async_fn` | `skid_pipe` | `futures` | `futures` / `skid_pipe` |
+|---|---:|---:|---:|---:|
+| async, 3 stages, success | 12.750 ns | 23.518 ns | 41.611 ns | 1.77x |
+| `try` async, 3 stages, success | 35.221 ns | 43.561 ns | 49.326 ns | 1.13x |
+| `try` async, 3 stages, first error | 11.715 ns | 19.292 ns | 25.322 ns | 1.31x |
+| async, 10 stages, success | 44.015 ns | 57.716 ns | 153.390 ns | 2.66x |
+| `try` async, 10 stages, first error | 11.464 ns | 19.583 ns | 74.135 ns | 3.79x |
+
+No two arms' confidence intervals overlap in any group.
+
+`skid-pipe` beats the combinators in every group, and by more as the chain
+grows: 1.1x to 1.8x at three stages, 2.7x to 3.8x at ten. The gap scales with
+stage count because the rebuild the combinator arm performs each run is
+proportional to the chain, while the pipeline is already built and `run` only
+issues a future for it.
+
+The first-error rows matter most for reading the rest of this file. The 3-stage
+`TryAsyncPipe` row costs 64.7% over a direct call and the 10-stage one 70.8%,
+which the sections above treat as this crate's weakest result. `and_then` on the
+same shape costs 116.2% and 546.7%. The short-circuit overhead is real, and it
+is what static async composition costs; the ecosystem's usual answer costs more
+of it.
+
+The baseline wins everywhere, and that is the honest headline. A plain
+`async fn` is faster than both crates in all five groups, by 24% to 85% against
+`skid-pipe`. What `skid-pipe` sells against it is a composed computation that is
+a value — returnable as `impl Chain`, re-runnable with `FnMut` stages that keep
+state, typed at every connection — not speed. Reach for the `async fn` when the
+chain is short and lives in one place.
+
+Ten stages is the ceiling here because a combinator chain nests its type once
+per stage, which is the same wall that made this crate flatten its own chains in
+groups of eight.
+
+Reproduce with:
+
+```sh
+cargo bench --bench vs_futures -- \
+  --warm-up-time 1 --measurement-time 3 --sample-size 100
+```

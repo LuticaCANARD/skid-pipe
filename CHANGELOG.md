@@ -50,6 +50,12 @@ GAT migration. No 0.2.0 release is implied until this section is dated.
   cancellation, first-error short-circuiting, and 100-stage chains.
 - Added a reproducible Cortex-M fixture for comparing direct and pipeline
   future layout and one-poll code size, at ten and at 100 stages.
+- Added a benchmark against the `futures` combinators on identical stages.
+  `skid-pipe` measures 1.1x to 1.8x faster at three stages and 2.7x to 3.8x at
+  ten, the gap growing because a combinator chain is consumed by one `await`
+  and so is rebuilt per run. First-error short-circuiting, this crate's weakest
+  result against direct calls, costs `and_then` more on the same shape. A plain
+  `async fn` beats both crates in every group.
 
 ### Changed
 
