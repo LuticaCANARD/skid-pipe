@@ -8,11 +8,23 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ## [Unreleased]
 
-These changes target 0.2.0 because the async execution traits have a breaking
-GAT migration. No 0.2.0 release is implied until this section is dated.
+## [0.2.0] - 2026-08-23
+
+This release carries a breaking GAT migration in the async execution traits.
+See the migration note at the end of this section.
 
 ### Added
 
+- Added the opt-in `lazy-construction` feature. Each link future then parks its
+  input and builds its tail chain's future on its own first poll, so creating a
+  run future is one layer's work regardless of chain length and one dropped
+  before its first poll is `O(1)`. Creating a 100-stage run future drops from
+  9.8489 ns to 1.2309 ns; the work moves into `poll`, where the extra state per
+  layer costs more than it saved, so the 100-stage first error regresses 19.6%
+  and the three-stage success rows 9.2% and 1.6%. It is off by default because
+  the default build optimizes end-to-end latency. The public API, the run
+  future's 240-byte layout, and the guarantee that no stage runs before the
+  first poll are identical either way.
 - Added `TryAsyncPipe` for statically composing asynchronous
   `Result<T, E>` stages with first-error short-circuiting.
 - Added the opt-in `tokio` feature with `spawn` and `spawn_local` extension
@@ -40,6 +52,19 @@ GAT migration. No 0.2.0 release is implied until this section is dated.
   cancellation, first-error short-circuiting, and 100-stage chains.
 - Added a reproducible Cortex-M fixture for comparing direct and pipeline
   future layout and one-poll code size, at ten and at 100 stages.
+- Added a diagnostic benchmark that splits an async run into the cost of
+  creating its run future, the cost the fallible machinery adds over the
+  infallible one on identical payloads, and the per-group cost of a first-error
+  short-circuit at 1, 3, 10 and 100 stages.
+- Added a benchmark against the `futures` combinators on identical stages.
+  `skid-pipe` measures 1.1x to 1.8x faster at three stages and 2.7x to 3.8x at
+  ten, the gap growing because a combinator chain is consumed by one `await`
+  and so is rebuilt per run. First-error short-circuiting, this crate's weakest
+  result against direct calls, costs `and_then` more on the same shape. A plain
+  `async fn` beats both crates in every group, and the section says what the
+  crate offers instead of speed, which is composition as a value rather than
+  state retention: an async stage capturing state by move accumulates nothing,
+  here as in a plain async closure.
 
 ### Changed
 
@@ -118,8 +143,7 @@ migration. A hand-written `AsyncStep` or `AsyncChain` implementation must add
 its `type Future<'a>` and return `Self::Future<'_>` from `call` or `run`.
 `TryAsyncPipe` is additive. Code that called `AsyncChain::run` or
 `TryAsyncChain::run` on `End` directly must call the pipeline instead; no such
-call could reach a stage. Because the async execution traits changed, this set
-of changes is intended for the next pre-1.0 minor release.
+call could reach a stage.
 
 ## [0.1.2] - 2026-08-22
 
@@ -148,7 +172,8 @@ No code migration is required from 0.1.0.
 - Added native, WebAssembly, and embedded target validation with Rust 1.86 as
   the minimum supported Rust version (MSRV).
 
-[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/LuticaCANARD/skid-pipe/releases/tag/v0.1.0

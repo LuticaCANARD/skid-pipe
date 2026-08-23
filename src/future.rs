@@ -327,11 +327,8 @@ macro_rules! stage_machine {
         #[must_use = "futures do nothing unless you `.await` or poll them"]
         pub struct $name<'a, Pipeline, Input, TailFuture, $($stepfut,)* $($error)?> {
             pipeline: Borrowed<'a, Pipeline>,
-            slot: $slot<TailFuture, $($stepfut),*>,
+            slot: $slot<Input, TailFuture, $($stepfut),*>,
             state: $state,
-            // The input is consumed by `new`; the chain's `Future` GAT still
-            // names it, so it stays a parameter.
-            _input: PhantomData<fn(Input)>,
             $(_error: PhantomData<fn() -> $error>,)?
             _pin: PhantomPinned,
         }
@@ -340,6 +337,7 @@ macro_rules! stage_machine {
         where
             $($bounds)*
         {
+            #[cfg(not(feature = "lazy-construction"))]
             #[inline(always)]
             pub(crate) fn new(pipeline: &'a mut $($pipeline)*, input: Input) -> Self {
                 let pipeline = Borrowed::new(pipeline);
@@ -355,7 +353,23 @@ macro_rules! stage_machine {
                         tail: ManuallyDrop::new($run(rest, input)),
                     },
                     state: $state::Tail,
-                    _input: PhantomData::<fn(Input)>,
+                    $(_error: PhantomData::<fn() -> $error>,)?
+                    _pin: PhantomPinned,
+                }
+            }
+
+            /// Parks the input and leaves the tail chain's future to the first
+            /// poll, so creating a run future is one layer's work rather than
+            /// the whole nest's.
+            #[cfg(feature = "lazy-construction")]
+            #[inline(always)]
+            pub(crate) fn new(pipeline: &'a mut $($pipeline)*, input: Input) -> Self {
+                Self {
+                    pipeline: Borrowed::new(pipeline),
+                    slot: $slot {
+                        input: ManuallyDrop::new(input),
+                    },
+                    state: $state::Input,
                     $(_error: PhantomData::<fn() -> $error>,)?
                     _pin: PhantomPinned,
                 }
@@ -378,6 +392,25 @@ macro_rules! stage_machine {
                     let this = unsafe { self.as_mut().get_unchecked_mut() };
 
                     match this.state {
+                        #[cfg(feature = "lazy-construction")]
+                        $state::Input => {
+                            // SAFETY: `Input` identified the initialized member.
+                            // The tag is cleared before the owned input moves
+                            // out, so no later drop repeats it.
+                            this.state = $state::Done;
+                            let input =
+                                unsafe { ManuallyDrop::take(&mut this.slot.input) };
+                            // SAFETY: a field projection of the same `&'a mut`
+                            // sub-pipeline. The slot holds no future yet, so this
+                            // is the only live derivation, and this state is
+                            // entered at most once because the tag only advances.
+                            // Asking the tail chain for its future runs no stage.
+                            let rest = unsafe {
+                                &mut (*this.pipeline.as_ptr()) $(.$tail_seg)*
+                            };
+                            this.slot.tail = ManuallyDrop::new($run(rest, input));
+                            this.state = $state::Tail;
+                        }
                         $(
                             $state::$from => {
                                 // SAFETY: the state tag names the initialized
@@ -452,6 +485,8 @@ macro_rules! stage_machine {
                 // It is replaced first so a panicking destructor cannot run twice.
                 unsafe {
                     match state {
+                        #[cfg(feature = "lazy-construction")]
+                        $state::Input => ManuallyDrop::drop(&mut self.slot.input),
                         $($state::$from => ManuallyDrop::drop(&mut self.slot.$from_member),)+
                         $state::$last => ManuallyDrop::drop(&mut self.slot.$last_member),
                         $state::Done => {}
@@ -464,12 +499,20 @@ macro_rules! stage_machine {
 
 #[derive(Clone, Copy)]
 enum State1 {
+    #[cfg(feature = "lazy-construction")]
+    Input,
     Tail,
     Step1,
     Done,
 }
 
-union Slot1<TailFuture, F1> {
+union Slot1<Input, TailFuture, F1> {
+    // Only `lazy-construction` parks an input here. The member costs
+    // no layout either way: `TailFuture` bottoms out in a
+    // `FirstStageFuture` that holds this same `Input`, so the union is
+    // at least this wide already.
+    #[cfg_attr(not(feature = "lazy-construction"), allow(dead_code))]
+    input: ManuallyDrop<Input>,
     tail: ManuallyDrop<TailFuture>,
     s1: ManuallyDrop<F1>,
 }
@@ -536,13 +579,21 @@ stage_machine! {
 
 #[derive(Clone, Copy)]
 enum State2 {
+    #[cfg(feature = "lazy-construction")]
+    Input,
     Tail,
     Step1,
     Step2,
     Done,
 }
 
-union Slot2<TailFuture, F1, F2> {
+union Slot2<Input, TailFuture, F1, F2> {
+    // Only `lazy-construction` parks an input here. The member costs
+    // no layout either way: `TailFuture` bottoms out in a
+    // `FirstStageFuture` that holds this same `Input`, so the union is
+    // at least this wide already.
+    #[cfg_attr(not(feature = "lazy-construction"), allow(dead_code))]
+    input: ManuallyDrop<Input>,
     tail: ManuallyDrop<TailFuture>,
     s1: ManuallyDrop<F1>,
     s2: ManuallyDrop<F2>,
@@ -616,6 +667,8 @@ stage_machine! {
 
 #[derive(Clone, Copy)]
 enum State4 {
+    #[cfg(feature = "lazy-construction")]
+    Input,
     Tail,
     Step1,
     Step2,
@@ -624,7 +677,13 @@ enum State4 {
     Done,
 }
 
-union Slot4<TailFuture, F1, F2, F3, F4> {
+union Slot4<Input, TailFuture, F1, F2, F3, F4> {
+    // Only `lazy-construction` parks an input here. The member costs
+    // no layout either way: `TailFuture` bottoms out in a
+    // `FirstStageFuture` that holds this same `Input`, so the union is
+    // at least this wide already.
+    #[cfg_attr(not(feature = "lazy-construction"), allow(dead_code))]
+    input: ManuallyDrop<Input>,
     tail: ManuallyDrop<TailFuture>,
     s1: ManuallyDrop<F1>,
     s2: ManuallyDrop<F2>,
@@ -712,6 +771,8 @@ stage_machine! {
 
 #[derive(Clone, Copy)]
 enum State8 {
+    #[cfg(feature = "lazy-construction")]
+    Input,
     Tail,
     Step1,
     Step2,
@@ -724,7 +785,13 @@ enum State8 {
     Done,
 }
 
-union Slot8<TailFuture, F1, F2, F3, F4, F5, F6, F7, F8> {
+union Slot8<Input, TailFuture, F1, F2, F3, F4, F5, F6, F7, F8> {
+    // Only `lazy-construction` parks an input here. The member costs
+    // no layout either way: `TailFuture` bottoms out in a
+    // `FirstStageFuture` that holds this same `Input`, so the union is
+    // at least this wide already.
+    #[cfg_attr(not(feature = "lazy-construction"), allow(dead_code))]
+    input: ManuallyDrop<Input>,
     tail: ManuallyDrop<TailFuture>,
     s1: ManuallyDrop<F1>,
     s2: ManuallyDrop<F2>,
