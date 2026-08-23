@@ -127,20 +127,32 @@ macro_rules! append_nine {
     };
 }
 
+// Unrolled, not a `for` loop: the other two arms are static chains, and a
+// runtime loop is a different shape for the optimizer to work on.
 async fn direct_ten(input: Value) -> Value {
-    let mut value = input;
-    for _ in 0..10 {
-        value = ready_step(value).await;
-    }
-    value
+    let value = ready_step(input).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    let value = ready_step(value).await;
+    ready_step(value).await
 }
 
 async fn direct_try_ten(input: Value) -> Result<Value, u8> {
-    let mut value = input;
-    for _ in 0..10 {
-        value = try_ready_step(value).await?;
-    }
-    Ok(value)
+    let value = try_ready_step(input).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    let value = try_ready_step(value).await?;
+    try_ready_step(value).await
 }
 
 fn block_on<Output>(future: impl Future<Output = Output>) -> Output {
