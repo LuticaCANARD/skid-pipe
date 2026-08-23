@@ -32,3 +32,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[bench]]
 name = "composition"
 harness = false
+
+[[bench]]
+name = "diagnose"
+harness = false
