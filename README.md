@@ -72,7 +72,8 @@ The deliberately narrow contract is the point:
 
 Use a value-piping crate when execution should happen immediately. Use Tower
 when the problem is service readiness, backpressure, retry, timeout, or HTTP
-middleware.
+middleware. [Alternatives](#alternatives) compares both, and measures this
+crate against the `futures` combinators and against a plain `async fn`.
 
 ## Core model
 
@@ -130,7 +131,12 @@ measurement before making embedded optimization claims.
 
 The checked-in [benchmark snapshot](BENCHMARKS.md) records the full direct
 comparison, including 100-stage runtime, future layout, and a Cortex-M code
-size probe. It intentionally reports the unfavorable long-async cases too.
+size probe. It intentionally reports the unfavorable long-async cases too, and
+records three optimizations that were measured and did not land.
+
+A second benchmark, `benches/vs_futures.rs`, compares composition against the
+`futures` combinators and against a plain `async fn`. See
+[Alternatives](#alternatives).
 
 ## Examples
 
@@ -194,6 +200,53 @@ assert_eq!(pipeline.run(7), (7, 2));
 
 The mutable pipeline borrow makes this sequencing explicit. Synchronization for
 state shared outside the pipeline remains the caller's responsibility.
+
+This applies to `Pipe` and `TryPipe`. **An async stage cannot keep state by
+capturing it into the future it returns.** `AsyncStep`'s blanket implementation
+maps a stage to `type Future<'a> = Fut`, which does not borrow the closure, so
+each call moves a fresh copy of the captured state into a new future and the
+original is never updated. This compiles and silently counts nothing:
+
+```rust
+use skid_pipe::AsyncPipe;
+
+# async fn example() {
+let mut calls = 0_u32;
+let mut pipeline = AsyncPipe::new(move |value: u16| async move {
+    calls += 1;
+    (value, calls)
+});
+
+assert_eq!(pipeline.run(7).await, (7, 1));
+assert_eq!(pipeline.run(7).await, (7, 1)); // not (7, 2)
+# }
+```
+
+Hold async state in a [`Cell`](https://doc.rust-lang.org/core/cell/struct.Cell.html)
+captured by shared reference instead:
+
+```rust
+use core::cell::Cell;
+use skid_pipe::AsyncPipe;
+
+# async fn example() {
+let calls = Cell::new(0_u32);
+let mut pipeline = AsyncPipe::new(|value: u16| {
+    let calls = &calls;
+    async move {
+        calls.set(calls.get() + 1);
+        (value, calls.get())
+    }
+});
+
+assert_eq!(pipeline.run(7).await, (7, 1));
+assert_eq!(pipeline.run(7).await, (7, 2));
+# }
+```
+
+That `Cell` is ordinary Rust and works with or without this crate, so async
+state retention is not something `skid-pipe` gives you. Composition as a value
+is. `TryAsyncPipe` behaves the same way.
 
 ## Branching
 
@@ -410,6 +463,60 @@ trait to hide their recursive concrete type. These execution traits are
 `Sized`; the core deliberately offers no type-erased, boxed, or
 runtime-configured pipeline. That keeps every stage connection statically
 checked, allocation-free, and free of dynamic dispatch.
+
+## Alternatives
+
+Several crates carry "pipeline" in their name while composing different things.
+Knowing which one you need settles most of the choice:
+
+| | Composes | Result is |
+|---|---|---|
+| `pipe-trait`, `pipeline`, `pipeop`, `apply` | a value through functions | evaluated on the spot |
+| `futures` combinators | futures | a chain one `await` consumes |
+| `tower` | request/response services | a `Service` with readiness |
+| `skid-pipe` | functions | a value you run repeatedly |
+
+`x.pipe(f).pipe(g)` runs immediately and leaves nothing behind, so those crates
+are not alternatives to this one despite the shared vocabulary. Use `tower` when
+the problem is readiness, backpressure, retry, timeout, or HTTP middleware;
+`skid-pipe` models none of those and should not be bent into them. `tower` needs
+`std`.
+
+`futures` is the real overlap: it is `no_std`-capable and its combinators chain
+async stages. The difference is that it composes futures, so a caller running
+the same computation twice builds the chain twice. `benches/vs_futures.rs`
+measures that on identical stage bodies, payloads, and `Ready` futures:
+
+| Group | plain `async fn` | `skid-pipe` | `futures` |
+|---|---:|---:|---:|
+| async, 3 stages | 12.750 ns | 23.518 ns | 41.611 ns |
+| `try` async, 3 stages | 35.221 ns | 43.561 ns | 49.326 ns |
+| `try` async, 3 stages, first error | 11.715 ns | 19.292 ns | 25.322 ns |
+| async, 10 stages | 44.015 ns | 57.716 ns | 153.390 ns |
+| `try` async, 10 stages, first error | 11.464 ns | 19.583 ns | 74.135 ns |
+
+`skid-pipe` is 1.1x to 1.8x faster than the combinators at three stages and
+2.7x to 3.8x at ten, the gap widening because the rebuild scales with the chain
+while `run` only issues a future for a pipeline that already exists.
+
+The last column is also the answer to a question this file raises elsewhere:
+first-error short-circuiting is `TryAsyncPipe`'s worst result against direct
+calls, and `and_then` on the same shape costs more of it. That overhead is what
+static async composition costs, not something this crate does badly.
+
+**A plain `async fn` beats both crates in every group**, by 24% to 85% against
+`skid-pipe`. It is also reusable — you can call it as often as you like. What it
+cannot do is be assembled: its stages are fixed where it is written, it cannot
+be built conditionally or returned from a builder as one typed value, and each
+connection is checked only inside its own body. That is what `skid-pipe` sells,
+and it is not speed. When the chain is short and lives in one place, write the
+`async fn`.
+
+Neither does `skid-pipe` fix the one reuse problem an `async fn` does have:
+state across calls needs a `Cell` either way, as
+[Stateful pipelines](#stateful-pipelines) shows.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full comparison and its method.
 
 ## What this crate is not
 
