@@ -29,6 +29,13 @@ jobs:
       - name: Pin tokio on the MSRV toolchain
         if: matrix.toolchain == '1.86'
         run: cargo update -p tokio --precise 1.53.0
+      # Same reasoning for the benchmark-only `futures`: `cargo test` and
+      # `cargo clippy --all-targets` build dev-dependencies, so an unpinned
+      # resolve can fail this leg on an unrelated PR. Bump with the floor in
+      # Cargo.toml.
+      - name: Pin futures on the MSRV toolchain
+        if: matrix.toolchain == '1.86'
+        run: cargo update -p futures --precise 0.3.34
       - name: Check unsafe code stays isolated to src/future.rs
         run: |
           pattern='allow(unsafe_code)\|allow(unsafe_op_in_unsafe_fn)'

@@ -8,8 +8,10 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ## [Unreleased]
 
-These changes target 0.2.0 because the async execution traits have a breaking
-GAT migration. No 0.2.0 release is implied until this section is dated.
+## [0.2.0] - 2026-08-23
+
+This release carries a breaking GAT migration in the async execution traits.
+See the migration note at the end of this section.
 
 ### Added
 
@@ -50,6 +52,10 @@ GAT migration. No 0.2.0 release is implied until this section is dated.
   cancellation, first-error short-circuiting, and 100-stage chains.
 - Added a reproducible Cortex-M fixture for comparing direct and pipeline
   future layout and one-poll code size, at ten and at 100 stages.
+- Added a diagnostic benchmark that splits an async run into the cost of
+  creating its run future, the cost the fallible machinery adds over the
+  infallible one on identical payloads, and the per-group cost of a first-error
+  short-circuit at 1, 3, 10 and 100 stages.
 - Added a benchmark against the `futures` combinators on identical stages.
   `skid-pipe` measures 1.1x to 1.8x faster at three stages and 2.7x to 3.8x at
   ten, the gap growing because a combinator chain is consumed by one `await`
@@ -137,8 +143,7 @@ migration. A hand-written `AsyncStep` or `AsyncChain` implementation must add
 its `type Future<'a>` and return `Self::Future<'_>` from `call` or `run`.
 `TryAsyncPipe` is additive. Code that called `AsyncChain::run` or
 `TryAsyncChain::run` on `End` directly must call the pipeline instead; no such
-call could reach a stage. Because the async execution traits changed, this set
-of changes is intended for the next pre-1.0 minor release.
+call could reach a stage.
 
 ## [0.1.2] - 2026-08-22
 
@@ -167,7 +172,8 @@ No code migration is required from 0.1.0.
 - Added native, WebAssembly, and embedded target validation with Rust 1.86 as
   the minimum supported Rust version (MSRV).
 
-[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/LuticaCANARD/skid-pipe/releases/tag/v0.1.0
