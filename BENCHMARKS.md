@@ -152,3 +152,64 @@ nm -S --size-sort \
 The fixture also exports four `*_future_bytes` functions so a target
 disassembler can verify the returned layout constants without executing the
 firmware image.
+
+## Rejected optimizations
+
+Three changes aimed at the two `TryAsyncPipe` rows above were implemented and
+measured against this snapshot's machine. None landed. They are recorded here
+so the same ground is not retried from the same reasoning.
+
+The `benches/diagnose.rs` groups split those rows into the costs behind them:
+creating a run future without polling it, an infallible and a fallible pipeline
+over identical payloads, and a first-error short-circuit at 1, 3, 10 and 100
+stages. That last group is what makes the target concrete. The cost is not
+proportional to chain length:
+
+| First error at stage 1 | Time | Over direct |
+|---|---:|---:|
+| direct call | 13.195 ns | — |
+| 1-stage `TryAsyncPipe` | 13.327 ns | +0.13 ns |
+| 3-stage | 19.229 ns | +6.03 ns |
+| 10-stage | 19.982 ns | +6.79 ns |
+| 100-stage | 33.559 ns | +20.36 ns |
+
+A single-stage chain matches the direct call, because it is a bare
+`FirstStageFuture` with no link machine. The first link machine adds about 6 ns
+and each further group about 1.2 ns. The fixed entry cost, not the chain
+length, is what the 3-stage row pays.
+
+**`#[inline(always)]` on the generated `Drop`.** On the short-circuit path every
+enclosing machine drops a child that has already cleared its own tag, so those
+drops are inert; they were the only methods in `future.rs` still out of line.
+Inlining them regressed the 100-stage first error by 28.1% and the 10-stage one
+by 6.1% (p = 0.00), and improved only the 3-stage row, by 4.3%. The per-layer
+saving is real but the accumulated code growth costs more, which is consistent
+with the entry-point size note above: these paths are already at the inlining
+budget, so any change that grows them needs measuring rather than reasoning.
+
+**Dispatching on a register-resident state tag.** Each machine's `poll` loops
+on `match this.state`, re-reading the tag it stored on the previous transition.
+Hoisting the tag into a local, updating it alongside the field, and deriving
+`this` once outside the loop leaves the field writes — and so the drop protocol
+— untouched while removing that store-to-load dependency. It changed nothing:
+every row moved by at most 1.7%, and the `first_error_depth/direct` control,
+which contains no pipeline code, moved 1.7% in the same run. LLVM was already
+forwarding the stores.
+
+**Lazy tail construction.** Each machine's `new` builds its tail chain's future
+immediately, so creating a 100-stage run future costs 9.7967 ns before any
+stage runs. Parking the input in the slot union instead, behind a new `Input`
+state, and building the tail on the first poll cuts that to 1.2431 ns, an 87.6%
+reduction, and makes a run future that is dropped before its first poll O(1).
+The work is not removed, only moved: it lands in `poll`, where one extra state
+per layer costs more than it saved. The 100-stage first error regressed 19.8%,
+the 10-stage 14.4%, the 3-stage 9.0%, and the same-shape success rows 11.6%
+(infallible) and 3.8% (fallible), all at p = 0.00. This is a trade, not a
+failure — it is the right change for a workload that creates and cancels run
+futures — but it is a loss on end-to-end latency, which is what these rows
+track.
+
+Two of the three were predicted to help from reading the code and did not. The
+one that did exactly what it was designed to do still lost overall. Treat the
+per-layer costs above as measured, and anything about why they are what they
+are as a hypothesis until a benchmark says otherwise.
