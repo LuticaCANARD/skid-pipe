@@ -31,6 +31,9 @@ tokio = { version = "1.53", default-features = false, features = ["rt"], optiona
 
 [dev-dependencies]
 criterion = "=0.8.2"
+# Benchmark-only. `default-features = false` keeps the comparison on the
+# core-only combinators, matching this crate's no_std, no-alloc default.
+futures = { version = "0.3", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -42,4 +45,8 @@ harness = false
 
 [[bench]]
 name = "diagnose"
+harness = false
+
+[[bench]]
+name = "vs_futures"
 harness = false
