@@ -8,6 +8,18 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-24
+
+### Added
+
+- Added `benches/vs_tower.rs`, a separate comparison against Tower's
+  ready-and-call service path using the same fallible `Ready` stages.
+
+### Changed
+
+- Documented the boundary against Tower and against task/channel pipeline
+  crates in the README and BENCHMARKS.md. No library code changed.
+
 ## [0.2.0] - 2026-08-23
 
 This release carries a breaking GAT migration in the async execution traits.
@@ -172,7 +184,8 @@ No code migration is required from 0.1.0.
 - Added native, WebAssembly, and embedded target validation with Rust 1.86 as
   the minimum supported Rust version (MSRV).
 
-[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.0...v0.1.1

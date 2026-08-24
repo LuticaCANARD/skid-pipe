@@ -1,6 +1,6 @@
 [package]
 name = "skid-pipe"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Reusable, state-capable static computation pipelines for Rust core"
 license = "MIT"
@@ -34,6 +34,9 @@ criterion = "=0.8.2"
 # Benchmark-only. `default-features = false` keeps the comparison on the
 # core-only combinators, matching this crate's no_std, no-alloc default.
 futures = { version = "0.3", default-features = false }
+# `tower` is deliberately benchmark-only: it models request/response services,
+# not this crate's no_std function composition API.
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -49,4 +52,8 @@ harness = false
 
 [[bench]]
 name = "vs_futures"
+harness = false
+
+[[bench]]
+name = "vs_tower"
 harness = false

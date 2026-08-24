@@ -315,3 +315,57 @@ Reproduce with:
 cargo bench --bench vs_futures -- \
   --warm-up-time 1 --measurement-time 3 --sample-size 100
 ```
+
+## Against Tower services
+
+Tower is a useful adjacent comparison, but not a substitute for this crate.
+Its unit of composition is a request/response `Service` with a readiness
+protocol; it requires `std`, and it owns middleware concerns such as retry,
+timeout, and backpressure. `skid-pipe` composes local functions, is `no_std` by
+default, and has none of that protocol.
+
+`benches/vs_tower.rs` measures a small but fair overlap: three fallible,
+immediately-ready stages with the identical `Value -> Ready<Result<Value,
+Infallible>>` bodies in all arms. The Tower arm is a reusable
+`ServiceBuilder::and_then` stack over an immediately-ready terminal service and
+uses Tower's normal `ready().await.call(input).await` invocation. Thus its
+number includes the readiness contract a real Tower caller must drive; it does
+not include HTTP, I/O, retries, or a Tokio scheduler.
+
+This is a separate 2026-08-23 revalidation run, so compare arms within this
+table only rather than to the earlier `futures` snapshot above:
+
+| Group | plain `async fn` | `skid-pipe` | Tower ready + call | Tower / `skid-pipe` |
+|---|---:|---:|---:|---:|
+| try async, 3 stages, success | 12.103 ns | 19.570 ns | 34.971 ns | 1.79x |
+
+The direct `async fn` remains the lowest-cost fixed computation. For a
+reusable, typed local chain, `skid-pipe` avoids the service protocol and its
+extra future combinators. Use Tower when the workload actually needs its
+service semantics, not to run local computation stages faster.
+
+Run the comparison with:
+
+```sh
+cargo +1.86 bench --bench vs_tower -- \
+  --warm-up-time 1 --measurement-time 3 --sample-size 100
+```
+
+## Other pipeline libraries
+
+The following crates should not be put in the nanosecond single-item table;
+their execution models answer different questions. A valid comparison needs a
+throughput and memory/backpressure workload with many items and realistic
+pending work, rather than a one-item `Ready` microbenchmark.
+
+| Library family | Model | Appropriate benchmark |
+|---|---|---|
+| `async-pipes`, `pumps`, `pipelines` | worker tasks/threads and channels | items/s, p50/p99 end-to-end latency, bounded-queue memory, and scaling by worker count |
+| `pipeline-toolkit` | async steps over a type-keyed dynamic context | workflow wiring, context access, and error-path latency on a representative workflow |
+| `pipexec` | reusable scratchpad stage executor | same-context synchronous stage latency, static vs dynamic dispatch, and per-stage instrumentation cost |
+| `pipeline`, `pipe-trait`, `pipeop`, `apply` | immediate value-piping macros/traits | the direct-call baseline: they do not construct a reusable pipeline value |
+
+Mixing any of these into the tables above would make their task/channel,
+allocation, context lookup, or dispatch strategy look like a defect rather
+than the feature the caller chose. Add a workload-specific suite before making
+a throughput claim across those categories.

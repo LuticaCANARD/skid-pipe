@@ -138,6 +138,10 @@ A second benchmark, `benches/vs_futures.rs`, compares composition against the
 `futures` combinators and against a plain `async fn`. See
 [Alternatives](#alternatives).
 
+`benches/vs_tower.rs` separately compares the same fallible `Ready` stages to
+Tower's normal ready-and-call service path. It is intentionally separate: Tower
+implements a service contract rather than a local function pipeline.
+
 ## Examples
 
 | Example | Demonstrates | Run |
@@ -515,6 +519,29 @@ and it is not speed. When the chain is short and lives in one place, write the
 Neither does `skid-pipe` fix the one reuse problem an `async fn` does have:
 state across calls needs a `Cell` either way, as
 [Stateful pipelines](#stateful-pipelines) shows.
+
+Tower is the closest reusable abstraction with a different purpose. Its
+services have a readiness protocol and address server/client middleware; it is
+not `no_std`. A separate benchmark uses the same fallible `Ready` stages in a
+three-stage `ServiceBuilder::and_then` stack and invokes it through Tower's
+normal `ready().await.call()` path:
+
+| Group | plain `async fn` | `skid-pipe` | Tower ready + call |
+|---|---:|---:|---:|
+| try async, 3 stages, success | 12.103 ns | 19.570 ns | 34.971 ns |
+
+That is a 1.79x Tower/`skid-pipe` ratio in this machine-local run. It does not
+make Tower a poor choice: the measured difference is the cost of a service
+protocol this crate intentionally does not implement. Use Tower for readiness,
+backpressure, timeout, retry, and request/response middleware; use
+`skid-pipe` for a local, typed computation chain.
+
+Task/channel pipeline crates (`async-pipes`, `pumps`, and `pipelines`),
+type-keyed workflow kits (`pipeline-toolkit`), and scratchpad executors
+(`pipexec`) are also adjacent rather than direct nanosecond competitors. Their
+fair comparison is a multi-item throughput, p99 latency, memory, and
+backpressure workload; [BENCHMARKS.md](BENCHMARKS.md) records the exact
+boundary rather than presenting a misleading single-item ranking.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the full comparison and its method.
 
