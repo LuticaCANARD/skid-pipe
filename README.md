@@ -1,3 +1,5 @@
+<img src="assets/skid-pipe.svg" alt="" width="64" height="64">
+
 # skid-pipe
 
 > Reusable, state-capable, fully static computation pipelines for Rust `core`.
