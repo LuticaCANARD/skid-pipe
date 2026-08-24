@@ -332,12 +332,12 @@ uses Tower's normal `ready().await.call(input).await` invocation. Thus its
 number includes the readiness contract a real Tower caller must drive; it does
 not include HTTP, I/O, retries, or a Tokio scheduler.
 
-This is a separate 2026-08-23 revalidation run, so compare arms within this
+This is a separate 2026-08-24 revalidation run, so compare arms within this
 table only rather than to the earlier `futures` snapshot above:
 
 | Group | plain `async fn` | `skid-pipe` | Tower ready + call | Tower / `skid-pipe` |
 |---|---:|---:|---:|---:|
-| try async, 3 stages, success | 12.103 ns | 19.570 ns | 34.971 ns | 1.79x |
+| try async, 3 stages, success | 11.913 ns | 20.050 ns | 30.783 ns | 1.54x |
 
 The direct `async fn` remains the lowest-cost fixed computation. For a
 reusable, typed local chain, `skid-pipe` avoids the service protocol and its

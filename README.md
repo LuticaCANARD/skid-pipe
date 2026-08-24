@@ -528,9 +528,9 @@ normal `ready().await.call()` path:
 
 | Group | plain `async fn` | `skid-pipe` | Tower ready + call |
 |---|---:|---:|---:|
-| try async, 3 stages, success | 12.103 ns | 19.570 ns | 34.971 ns |
+| try async, 3 stages, success | 11.913 ns | 20.050 ns | 30.783 ns |
 
-That is a 1.79x Tower/`skid-pipe` ratio in this machine-local run. It does not
+That is a 1.54x Tower/`skid-pipe` ratio in this machine-local run. It does not
 make Tower a poor choice: the measured difference is the cost of a service
 protocol this crate intentionally does not implement. Use Tower for readiness,
 backpressure, timeout, retry, and request/response middleware; use
