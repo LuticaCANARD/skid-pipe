@@ -42,6 +42,7 @@ jobs:
       - run: cargo test
       - run: cargo test --features tokio
       - run: cargo test --features wide
+      - run: cargo test --features tokio,wide
       - run: cargo build
       - name: Check public API documentation
         env:
