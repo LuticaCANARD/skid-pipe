@@ -160,8 +160,9 @@ firmware image.
 
 Three changes aimed at the two `TryAsyncPipe` rows above were implemented and
 measured against this snapshot's machine. Two are recorded here so the same
-ground is not retried from the same reasoning; the third became the optional
-`lazy-construction` feature described after them.
+ground is not retried from the same reasoning; the third became the
+`lazy-construction` feature, which 0.3.0 removed because the async-block
+rewrite makes construction free unconditionally (see the last section).
 
 The `benches/diagnose.rs` groups split those rows into the costs behind them:
 creating a run future without polling it, an infallible and a fallible pipeline
@@ -203,57 +204,6 @@ forwarding the stores.
 Two of the three were predicted to help from reading the code and did not.
 Treat the per-layer costs above as measured, and anything about why they are
 what they are as a hypothesis until a benchmark says otherwise.
-
-The third is not rejected but optional; it is described below.
-
-## The `lazy-construction` feature
-
-Each machine's `new` builds its tail chain's future immediately, so creating a
-100-stage run future costs 9.8489 ns before any stage runs. The
-`lazy-construction` feature parks the input in the slot union instead, behind
-an `Input` state the feature adds, and builds the tail on the first poll.
-
-| | Default | `lazy-construction` | Change |
-|---|---:|---:|---:|
-| Create a 100-stage `TryAsyncPipe` run future | 9.8489 ns | 1.2309 ns | −87.5% |
-| Create a 100-stage `AsyncPipe` one | 9.8516 ns | 1.2182 ns | −87.6% |
-| Create a 3-stage one | 1.8354 ns | 1.2286 ns | −33.1% |
-| 100-stage first error | 34.084 ns | 40.758 ns | +19.6% |
-| 10-stage first error | 20.005 ns | 25.187 ns | +25.9% |
-| 3-stage first error | 20.005 ns | 21.092 ns | +5.4% |
-| 3-stage success, `AsyncPipe` | 23.737 ns | 25.925 ns | +9.2% |
-| 3-stage success, `TryAsyncPipe` | 44.563 ns | 45.269 ns | +1.6% |
-
-Both columns come from the same commit and the same session, with only the
-feature flag differing. Every row's confidence intervals are disjoint between
-the columns, while those of the `first_error_depth/direct` control, which
-contains no pipeline code, sit on top of each other ([12.896, 13.049] ns
-against [12.925, 13.034] ns). The deltas are the feature.
-
-Their magnitudes are less stable than those intervals suggest. An earlier
-run of the same pair put the 10-stage first error at +15.4% rather than
-+25.9%, and the 3-stage one at +9.4% rather than +5.4%. Between-run drift on
-this machine exceeds within-run precision on the shorter rows, so read the
-direction and the order of magnitude, not the second digit. The creation rows
-and the 100-stage first error reproduced across both runs to within a few
-tenths of a percent.
-
-Creating a run future becomes one layer's work regardless of chain length, and
-one dropped before its first poll becomes O(1). The work is not removed, only
-moved: it lands in `poll`, where one extra state per layer costs more than it
-saved. So the feature is off by default — the default build optimizes
-end-to-end latency — and is worth enabling only for a workload that creates run
-futures it may never poll.
-
-The run future's layout is identical either way. The slot union already had to
-be at least as wide as `Input`, because the tail future bottoms out in a
-`FirstStageFuture` that holds it, so the added member costs no bytes: the
-100-stage async and try-async futures measure 240 B on x86_64 under both
-configurations. The public API and the guarantee that no stage runs before the
-first poll are unchanged.
-
-The change that did exactly what it was designed to do still lost on latency.
-That is why it is a feature rather than a default.
 
 ## Against the `futures` combinators
 
@@ -369,3 +319,54 @@ Mixing any of these into the tables above would make their task/channel,
 allocation, context lookup, or dispatch strategy look like a defect rather
 than the feature the caller chose. Add a workload-specific suite before making
 a throughput claim across those categories.
+
+## The async-block rewrite (0.3.0)
+
+0.3.0 replaced the hand-written state machines in `src/future.rs` with one
+`async` block per group of eight stages. The composition shape is unchanged —
+arities one to eight terminate on `End`, longer chains fold eight at a time —
+so this measures the machine, not the algorithm. Both columns come from the
+same machine and session, `benches/composition.rs` and `benches/diagnose.rs`
+run against each tree in turn.
+
+| | 0.2.1 hand-written | 0.3.0 `async` block |
+|---|---:|---:|
+| `async_three_stage_ready/async_pipe` | 5.2975 ns | 9.0845 ns |
+| `try_async_three_stage_ready_success/try_async_pipe` | 20.820 ns | 11.270 ns |
+| `hundred_stage/async_ready_success/async_pipe` | 361.82 ns | 454.29 ns |
+| `hundred_stage/try_async_ready_success/try_async_pipe` | 397.61 ns | 452.95 ns |
+| `hundred_stage/try_async_error/first/try_async_pipe` | 23.744 ns | 32.089 ns |
+| Create a 3-stage run future | 1.3221 ns | 0.8789 ns |
+| Create a 100-stage run future | 7.0211 ns | 0.8850 ns |
+
+Construction no longer scales with chain length: an `async` block does nothing
+until its first poll, so the `O(stages / 8)` stores the old machines wrote at
+`run` are gone and the `lazy-construction` feature has nothing left to buy.
+
+Run-future size, from `examples/measure_footprint.rs` and a host-side
+`size_of_val` probe over the shorter chains an embedded target actually builds:
+
+| Stages | 0.2.1 `AsyncPipe` | 0.3.0 | 0.2.1 `TryAsyncPipe` | 0.3.0 |
+|---:|---:|---:|---:|---:|
+| 2 | 32 B | 24 B | 32 B | 24 B |
+| 4 | 48 B | 24 B | 48 B | 24 B |
+| 8 | 64 B | 24 B | 64 B | 32 B |
+| 100 | 240 B | 216 B | 240 B | 312 B |
+
+The compiler overlaps the stage futures of a group into one slot, so a group's
+future stops growing with its arity. The rows up to eight are 64-bit host
+measurements; the 100-stage row is the `no_std` footprint example.
+
+Flash, `tests/fixtures/no_std` built at `opt-level = "z"`, `.text` totals:
+
+| Target | 0.2.1 | 0.3.0 |
+|---|---:|---:|
+| `thumbv7em-none-eabihf` | 10,375 B | 6,651 B |
+| `thumbv6m-none-eabi` | 12,327 B | 9,737 B |
+
+The fixture's synchronous 100-stage paths are identical in both trees, so the
+async-only saving is larger than these totals show.
+
+One limit worth naming: a chain longer than 127 stages now needs
+`#![recursion_limit]` raised in the calling crate, where the hand-written
+machines did not. The crate's own 100-stage tests compile without it.

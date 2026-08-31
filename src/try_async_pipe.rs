@@ -1,28 +1,18 @@
 use core::future::Future;
 
-use crate::{
-    End, FirstStageFuture, TryStart, TryThenFuture, TryThenOctFuture, TryThenPairFuture,
-    TryThenQuadFuture,
-};
+use crate::End;
 
-type TryStepOutput<Step, Input, Error> = <Step as TryAsyncStep<Input, Error>>::Output;
-type TryChainOutput<Chain, Input, Error> = <Chain as TryAsyncChain<Input, Error>>::Output;
-
-/// A reusable, statically typed asynchronous pipeline of fallible functions.
+/// A reusable, statically typed fallible asynchronous pipeline.
 ///
-/// Every stage returns a [`Future`] whose output is
-/// `Result<Output, Error>`. A pipeline stops at the first error and never
-/// calls subsequent stages. The caller selects the executor and error type;
-/// the pipeline itself allocates nothing and performs no dynamic dispatch.
+/// Each stage returns a [`Future`] resolving to a [`Result`]. The chain stops
+/// at the first error and never enters a later stage.
 pub struct TryAsyncPipe<Head, Tail = End> {
-    // `crate::future` projects these to reach one stage at a time from a
-    // single stored pipeline pointer.
     pub(crate) head: Head,
     pub(crate) tail: Tail,
 }
 
 impl<Head> TryAsyncPipe<Head> {
-    /// Starts a fallible asynchronous pipeline with its first stage.
+    /// Starts a fallible asynchronous pipeline with its first step.
     #[inline(always)]
     pub const fn new(head: Head) -> Self {
         Self { head, tail: End }
@@ -30,7 +20,7 @@ impl<Head> TryAsyncPipe<Head> {
 }
 
 impl<Head, Tail> TryAsyncPipe<Head, Tail> {
-    /// Appends the next fallible asynchronous stage.
+    /// Appends the next fallible asynchronous step to this pipeline.
     #[inline(always)]
     pub const fn try_then<Next>(self, next: Next) -> TryAsyncPipe<Next, Self> {
         TryAsyncPipe {
@@ -39,40 +29,27 @@ impl<Head, Tail> TryAsyncPipe<Head, Tail> {
         }
     }
 
-    /// Returns a future that runs stages from left to right until one fails.
+    /// Returns a future that runs every stage from left to right, stopping at
+    /// the first error.
     ///
-    /// The caller selects where and how the future is polled. Creating the
-    /// future is lazy: no stage runs until the future is first polled.
-    /// Construction is still not free, because it writes one pipeline pointer
-    /// and one state tag per group of eight stages, so an unpolled run, or one
-    /// that short-circuits on the first stage's error, costs `O(stages / 8)`
-    /// stores. The mutable receiver permits `FnMut` stages to retain state
-    /// between completed runs. The returned future holds the pipeline's mutable borrow until it
-    /// completes or is dropped, so another run cannot start while it is live.
-    /// Dropping a pending future releases that borrow but does not roll back
-    /// state changes made by stages that were already polled.
-    /// To satisfy a `tokio::spawn`-style `Send + 'static` boundary, move the
-    /// pipeline into an `async move` task and call `run` inside that task.
+    /// Creating the future is lazy: no stage runs until it is first polled.
+    /// The future holds the mutable pipeline borrow, so one pipeline instance
+    /// cannot have overlapping runs.
     ///
     /// ```compile_fail
     /// use skid_pipe::TryAsyncPipe;
     ///
-    /// async fn step(value: u8) -> Result<u8, ()> {
-    ///     Ok(value + 1)
-    /// }
-    ///
-    /// # async fn overlapping_runs() {
-    /// let mut pipeline = TryAsyncPipe::new(step);
+    /// let mut pipeline =
+    ///     TryAsyncPipe::new(|value: u8| core::future::ready(Ok::<_, ()>(value + 1)));
     /// let first = pipeline.run(1);
-    /// let second = pipeline.run(2); // `first` still borrows `pipeline`
-    /// let _ = (first.await, second.await);
-    /// # }
+    /// let second = pipeline.run(2);
+    /// drop((first, second));
     /// ```
     #[inline(always)]
     pub fn run<Input, Error>(
         &mut self,
         input: Input,
-    ) -> <Self as TryAsyncChain<Input, Error>>::Future<'_>
+    ) -> impl Future<Output = Result<<Self as TryAsyncChain<Input, Error>>::Output, Error>>
     where
         Self: TryAsyncChain<Input, Error>,
     {
@@ -80,7 +57,7 @@ impl<Head, Tail> TryAsyncPipe<Head, Tail> {
     }
 }
 
-/// A callable asynchronous `Result`-returning pipeline stage.
+/// A callable fallible asynchronous pipeline stage.
 ///
 /// Every `FnMut(Input) -> Future<Output = Result<Output, Error>>` implements
 /// this trait automatically, so callers normally pass plain functions or
@@ -121,154 +98,101 @@ where
 /// [`TryAsyncPipe`] implements this trait as the recursive engine behind
 /// [`TryAsyncPipe::run`]. The trait is public so builder functions can return
 /// `impl TryAsyncChain<Input, Error, Output = O>` without naming the recursive
-/// concrete pipeline type.
+/// concrete pipeline type. External implementations must run stages from left
+/// to right and stop after the first error.
 ///
-/// `run` returns a concrete future and does not require allocation or dynamic
-/// dispatch. External implementations must run stages from left to right and
-/// stop after the first error.
+/// `async fn` here cannot name an auto trait bound. [`TryAsyncChainSend`]
+/// restates the same composition with `Send` promised, for callers that must
+/// prove it.
+#[allow(async_fn_in_trait)]
 pub trait TryAsyncChain<Input, Error>: Sized {
     /// The success value emitted when the completed pipeline resolves.
     type Output;
 
-    /// The concrete future created by this chain.
-    type Future<'a>: Future<Output = Result<Self::Output, Error>>
-    where
-        Self: 'a;
-
-    /// Creates the future that runs this chain until success or failure.
-    fn run(&mut self, input: Input) -> Self::Future<'_>;
+    /// Creates the future that runs this chain.
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error>;
 }
 
-impl<Head, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<Head, End>
+impl<S1, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<S1, End>
 where
-    Head: TryAsyncStep<Input, Error>,
+    S1: TryAsyncStep<Input, Error>,
 {
-    type Output = Head::Output;
-    type Future<'a>
-        = FirstStageFuture<'a, TryStart<Error>, Head, Input, Head::Future<'a>>
-    where
-        Self: 'a;
+    type Output = <S1 as TryAsyncStep<Input, Error>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        FirstStageFuture::new(&mut self.head, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        self.head.call(input).await
     }
 }
 
 impl<S1, S2, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<S2, TryAsyncPipe<S1, End>>
 where
-    TryAsyncPipe<S1, End>: TryAsyncChain<Input, Error>,
-    S2: TryAsyncStep<TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
 {
-    type Output = TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>;
-    type Future<'a>
-        = TryThenFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<S1, End> as TryAsyncChain<Input, Error>>::Future<'a>,
-        <S2 as TryAsyncStep<TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>>::Future<
-            'a,
-        >,
-        Error,
-    >
-    where
-        Self: 'a;
+    type Output = <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.head.call(input).await?;
+        self.head.call(carried).await
     }
 }
 
 impl<S1, S2, S3, Input, Error> TryAsyncChain<Input, Error>
     for TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>
 where
-    TryAsyncPipe<S1, End>: TryAsyncChain<Input, Error>,
-    S2: TryAsyncStep<TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
     S3: TryAsyncStep<
-            TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
             Error,
         >,
 {
-    type Output = TryStepOutput<
-        S3,
-        TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+    type Output = <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
         Error,
-    >;
-    type Future<'a>
-        = TryThenPairFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<S1, End> as TryAsyncChain<Input, Error>>::Future<'a>,
-        <S2 as TryAsyncStep<TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>>::Future<
-            'a,
-        >,
-        <S3 as TryAsyncStep<
-            TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
-            Error,
-        >>::Future<'a>,
-        Error,
-    >
-    where
-        Self: 'a;
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenPairFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.head.call(input).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
     }
 }
 
 impl<S1, S2, S3, S4, Input, Error> TryAsyncChain<Input, Error>
     for TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>
 where
-    TryAsyncPipe<S2, TryAsyncPipe<S1, End>>: TryAsyncChain<Input, Error>,
-    S3: TryAsyncStep<TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>, Error>,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
+    S3: TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        >,
     S4: TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
                 Error,
-            >,
+            >>::Output,
             Error,
         >,
 {
-    type Output = TryStepOutput<
-        S4,
-        TryStepOutput<
-            S3,
-            TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-            Error,
-        >,
-        Error,
-    >;
-    type Future<'a>
-        = TryThenPairFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<S2, TryAsyncPipe<S1, End>> as TryAsyncChain<Input, Error>>::Future<'a>,
+    type Output = <S4 as TryAsyncStep<
         <S3 as TryAsyncStep<
-            TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
             Error,
-        >>::Future<'a>,
-        <S4 as TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
+        >>::Output,
         Error,
-    >
-    where
-        Self: 'a;
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenPairFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.tail.head.call(input).await?;
+        let carried = self.tail.tail.head.call(carried).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
     }
 }
 
@@ -278,842 +202,590 @@ impl<S1, S2, S3, S4, S5, Input, Error> TryAsyncChain<Input, Error>
         TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
     >
 where
-    TryAsyncPipe<S1, End>: TryAsyncChain<Input, Error>,
-    S2: TryAsyncStep<TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
     S3: TryAsyncStep<
-            TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
             Error,
         >,
     S4: TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
                 Error,
-            >,
+            >>::Output,
             Error,
         >,
     S5: TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+            <S4 as TryAsyncStep<
+                <S3 as TryAsyncStep<
+                    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
                     Error,
-                >,
+                >>::Output,
                 Error,
-            >,
+            >>::Output,
             Error,
         >,
 {
-    type Output = TryStepOutput<
-        S5,
-        TryStepOutput<
-            S4,
-            TryStepOutput<
-                S3,
-                TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
-                Error,
-            >,
-            Error,
-        >,
-        Error,
-    >;
-    type Future<'a>
-        = TryThenQuadFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<S1, End> as TryAsyncChain<Input, Error>>::Future<'a>,
-        <S2 as TryAsyncStep<TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>>::Future<
-            'a,
-        >,
-        <S3 as TryAsyncStep<
-            TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
-            Error,
-        >>::Future<'a>,
+    type Output = <S5 as TryAsyncStep<
         <S4 as TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
                 Error,
-            >,
+            >>::Output,
             Error,
-        >>::Future<'a>,
-        <S5 as TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryStepOutput<S2, TryChainOutput<TryAsyncPipe<S1, End>, Input, Error>, Error>,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
+        >>::Output,
         Error,
-    >
-    where
-        Self: 'a;
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.tail.tail.head.call(input).await?;
+        let carried = self.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.head.call(carried).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
     }
 }
 
-impl<S1, S2, S3, S4, S5, S6, Input, Error> TryAsyncChain<Input, Error>
-    for TryAsyncPipe<
-        S6,
-        TryAsyncPipe<
-            S5,
-            TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-        >,
-    >
+impl<S1, S2, S3, S4, S5, S6, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>>>
 where
-    TryAsyncPipe<S2, TryAsyncPipe<S1, End>>: TryAsyncChain<Input, Error>,
-    S3: TryAsyncStep<TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>, Error>,
-    S4: TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                Error,
-            >,
-            Error,
-        >,
-    S5: TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S6: TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryStepOutput<
-                        S3,
-                        TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
 {
-    type Output = TryStepOutput<
-        S6,
-        TryStepOutput<
-            S5,
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-        Error,
-    >;
-    type Future<'a>
-        = TryThenQuadFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<S2, TryAsyncPipe<S1, End>> as TryAsyncChain<Input, Error>>::Future<'a>,
-        <S3 as TryAsyncStep<
-            TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-            Error,
-        >>::Future<'a>,
-        <S4 as TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S5 as TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S6 as TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryStepOutput<
-                        S3,
-                        TryChainOutput<TryAsyncPipe<S2, TryAsyncPipe<S1, End>>, Input, Error>,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        Error,
-    >
-    where
-        Self: 'a;
+    type Output = <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.tail.tail.tail.head.call(input).await?;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.head.call(carried).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
+
     }
 }
 
-impl<S1, S2, S3, S4, S5, S6, S7, Input, Error> TryAsyncChain<Input, Error>
-    for TryAsyncPipe<
-        S7,
-        TryAsyncPipe<
-            S6,
-            TryAsyncPipe<
-                S5,
-                TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-            >,
-        >,
-    >
+impl<S1, S2, S3, S4, S5, S6, S7, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<S7, TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>>>>
 where
-    TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>: TryAsyncChain<Input, Error>,
-    S4: TryAsyncStep<
-            TryChainOutput<TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>, Input, Error>,
-            Error,
-        >,
-    S5: TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryChainOutput<
-                    TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                    Input,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S6: TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryChainOutput<
-                        TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                        Input,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S7: TryAsyncStep<
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryStepOutput<
-                        S4,
-                        TryChainOutput<
-                            TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                            Input,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S7: TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
 {
-    type Output = TryStepOutput<
-        S7,
-        TryStepOutput<
-            S6,
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryChainOutput<
-                        TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                        Input,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-        Error,
-    >;
-    type Future<'a>
-        = TryThenQuadFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>> as TryAsyncChain<
-            Input,
-            Error,
-        >>::Future<'a>,
-        <S4 as TryAsyncStep<
-            TryChainOutput<TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>, Input, Error>,
-            Error,
-        >>::Future<'a>,
-        <S5 as TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryChainOutput<
-                    TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                    Input,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S6 as TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryChainOutput<
-                        TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                        Input,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S7 as TryAsyncStep<
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryStepOutput<
-                        S4,
-                        TryChainOutput<
-                            TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                            Input,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        Error,
-    >
-    where
-        Self: 'a;
+    type Output = <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.tail.tail.tail.tail.head.call(input).await?;
+        let carried = self.tail.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.head.call(carried).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
+
     }
 }
 
-impl<S1, S2, S3, S4, S5, S6, S7, S8, Input, Error> TryAsyncChain<Input, Error>
-    for TryAsyncPipe<
-        S8,
-        TryAsyncPipe<
-            S7,
-            TryAsyncPipe<
-                S6,
-                TryAsyncPipe<
-                    S5,
-                    TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-                >,
-            >,
-        >,
-    >
+impl<S1, S2, S3, S4, S5, S6, S7, S8, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<S8, TryAsyncPipe<S7, TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>>>>>
 where
-    TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>:
-        TryAsyncChain<Input, Error>,
-    S5: TryAsyncStep<
-            TryChainOutput<
-                TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-                Input,
-                Error,
-            >,
-            Error,
-        >,
-    S6: TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryChainOutput<
-                    TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-                    Input,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S7: TryAsyncStep<
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryChainOutput<
-                        TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-                        Input,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S8: TryAsyncStep<
-            TryStepOutput<
-                S7,
-                TryStepOutput<
-                    S6,
-                    TryStepOutput<
-                        S5,
-                        TryChainOutput<
-                            TryAsyncPipe<
-                                S4,
-                                TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>,
-                            >,
-                            Input,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
+    S1: TryAsyncStep<Input, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S7: TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S8: TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
 {
-    type Output = TryStepOutput<
-        S8,
-        TryStepOutput<
-            S7,
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryChainOutput<
-                        TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
-                        Input,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-        Error,
-    >;
-    type Future<'a>
-        = TryThenQuadFuture<'a, Self, Input, <TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>> as TryAsyncChain<Input, Error>>::Future<'a>, <S5 as TryAsyncStep<TryChainOutput<TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>, Input, Error>, Error>>::Future<'a>, <S6 as TryAsyncStep<TryStepOutput<S5, TryChainOutput<TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>, Input, Error>, Error>, Error>>::Future<'a>, <S7 as TryAsyncStep<TryStepOutput<S6, TryStepOutput<S5, TryChainOutput<TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>, Input, Error>, Error>, Error>, Error>>::Future<'a>, <S8 as TryAsyncStep<TryStepOutput<S7, TryStepOutput<S6, TryStepOutput<S5, TryChainOutput<TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>, Input, Error>, Error>, Error>, Error>, Error>>::Future<'a>, Error>
-    where
-        Self: 'a;
+    type Output = <S8 as TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(input).await?;
+        let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.head.call(carried).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
+
     }
 }
 
-impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input, Error> TryAsyncChain<Input, Error>
-    for TryAsyncPipe<
-        S8,
-        TryAsyncPipe<
-            S7,
-            TryAsyncPipe<
-                S6,
-                TryAsyncPipe<
-                    S5,
-                    TryAsyncPipe<
-                        S4,
-                        TryAsyncPipe<
-                            S3,
-                            TryAsyncPipe<S2, TryAsyncPipe<S1, TryAsyncPipe<TailHead, TailTail>>>,
-                        >,
-                    >,
-                >,
-            >,
-        >,
-    >
+impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input, Error> TryAsyncChain<Input, Error> for TryAsyncPipe<S8, TryAsyncPipe<S7, TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, TryAsyncPipe<TailHead, TailTail>>>>>>>>>
 where
     TryAsyncPipe<TailHead, TailTail>: TryAsyncChain<Input, Error>,
-    S1: TryAsyncStep<TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>, Error>,
-    S2: TryAsyncStep<
-            TryStepOutput<
-                S1,
-                TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                Error,
-            >,
-            Error,
-        >,
-    S3: TryAsyncStep<
-            TryStepOutput<
-                S2,
-                TryStepOutput<
-                    S1,
-                    TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S4: TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryStepOutput<
-                    S2,
-                    TryStepOutput<
-                        S1,
-                        TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S5: TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryStepOutput<
-                        S2,
-                        TryStepOutput<
-                            S1,
-                            TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S6: TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryStepOutput<
-                        S3,
-                        TryStepOutput<
-                            S2,
-                            TryStepOutput<
-                                S1,
-                                TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S7: TryAsyncStep<
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryStepOutput<
-                        S4,
-                        TryStepOutput<
-                            S3,
-                            TryStepOutput<
-                                S2,
-                                TryStepOutput<
-                                    S1,
-                                    TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                                    Error,
-                                >,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-    S8: TryAsyncStep<
-            TryStepOutput<
-                S7,
-                TryStepOutput<
-                    S6,
-                    TryStepOutput<
-                        S5,
-                        TryStepOutput<
-                            S4,
-                            TryStepOutput<
-                                S3,
-                                TryStepOutput<
-                                    S2,
-                                    TryStepOutput<
-                                        S1,
-                                        TryChainOutput<
-                                            TryAsyncPipe<TailHead, TailTail>,
-                                            Input,
-                                            Error,
-                                        >,
-                                        Error,
-                                    >,
-                                    Error,
-                                >,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
+    S1: TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S7: TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
+    S8: TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>,
 {
-    type Output = TryStepOutput<
-        S8,
-        TryStepOutput<
-            S7,
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryStepOutput<
-                        S4,
-                        TryStepOutput<
-                            S3,
-                            TryStepOutput<
-                                S2,
-                                TryStepOutput<
-                                    S1,
-                                    TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                                    Error,
-                                >,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >,
-        Error,
-    >;
-    type Future<'a>
-        = TryThenOctFuture<
-        'a,
-        Self,
-        Input,
-        <TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Future<'a>,
-        <S1 as TryAsyncStep<
-            TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-            Error,
-        >>::Future<'a>,
-        <S2 as TryAsyncStep<
-            TryStepOutput<
-                S1,
-                TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S3 as TryAsyncStep<
-            TryStepOutput<
-                S2,
-                TryStepOutput<
-                    S1,
-                    TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S4 as TryAsyncStep<
-            TryStepOutput<
-                S3,
-                TryStepOutput<
-                    S2,
-                    TryStepOutput<
-                        S1,
-                        TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S5 as TryAsyncStep<
-            TryStepOutput<
-                S4,
-                TryStepOutput<
-                    S3,
-                    TryStepOutput<
-                        S2,
-                        TryStepOutput<
-                            S1,
-                            TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S6 as TryAsyncStep<
-            TryStepOutput<
-                S5,
-                TryStepOutput<
-                    S4,
-                    TryStepOutput<
-                        S3,
-                        TryStepOutput<
-                            S2,
-                            TryStepOutput<
-                                S1,
-                                TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S7 as TryAsyncStep<
-            TryStepOutput<
-                S6,
-                TryStepOutput<
-                    S5,
-                    TryStepOutput<
-                        S4,
-                        TryStepOutput<
-                            S3,
-                            TryStepOutput<
-                                S2,
-                                TryStepOutput<
-                                    S1,
-                                    TryChainOutput<TryAsyncPipe<TailHead, TailTail>, Input, Error>,
-                                    Error,
-                                >,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        <S8 as TryAsyncStep<
-            TryStepOutput<
-                S7,
-                TryStepOutput<
-                    S6,
-                    TryStepOutput<
-                        S5,
-                        TryStepOutput<
-                            S4,
-                            TryStepOutput<
-                                S3,
-                                TryStepOutput<
-                                    S2,
-                                    TryStepOutput<
-                                        S1,
-                                        TryChainOutput<
-                                            TryAsyncPipe<TailHead, TailTail>,
-                                            Input,
-                                            Error,
-                                        >,
-                                        Error,
-                                    >,
-                                    Error,
-                                >,
-                                Error,
-                            >,
-                            Error,
-                        >,
-                        Error,
-                    >,
-                    Error,
-                >,
-                Error,
-            >,
-            Error,
-        >>::Future<'a>,
-        Error,
-    >
-    where
-        Self: 'a;
+    type Output = <S8 as TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        TryThenOctFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Result<Self::Output, Error> {
+        let carried = self.tail.tail.tail.tail.tail.tail.tail.tail.run(input).await?;
+        let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.tail.head.call(carried).await?;
+        let carried = self.tail.tail.head.call(carried).await?;
+        let carried = self.tail.head.call(carried).await?;
+        self.head.call(carried).await
+
+    }
+}
+
+/// The `Send` variant of [`TryAsyncChain`], for the same reason as
+/// [`AsyncChainSend`](crate::AsyncChainSend): the composed future is
+/// unnameable, so a `tokio::spawn` caller cannot bound it.
+pub trait TryAsyncChainSend<Input, Error>: TryAsyncChain<Input, Error> {
+    /// Creates the future that runs this chain, promising `Send`.
+    fn run_send(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = Result<Self::Output, Error>> + Send;
+}
+
+impl<S1, Input, Error> TryAsyncChainSend<Input, Error> for TryAsyncPipe<S1, End>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move { self.head.call(input).await }
+    }
+}
+
+impl<S1, S2, Input, Error> TryAsyncChainSend<Input, Error>
+    for TryAsyncPipe<S2, TryAsyncPipe<S1, End>>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>:
+        Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.head.call(input).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, Input, Error> TryAsyncChainSend<Input, Error>
+    for TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>:
+        Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        > + Send,
+    for<'a> <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+        Error,
+    >>::Future<'a>: Send,
+    <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+        Error,
+    >>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.head.call(input).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, Input, Error> TryAsyncChainSend<Input, Error>
+    for TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>:
+        Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        > + Send,
+    for<'a> <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+        Error,
+    >>::Future<'a>: Send,
+    <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+        Error,
+    >>::Output: Send,
+    S4: TryAsyncStep<
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+                Error,
+            >>::Output,
+            Error,
+        > + Send,
+    for<'a> <S4 as TryAsyncStep<
+        <S3 as TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        >>::Output,
+        Error,
+    >>::Future<'a>: Send,
+    <S4 as TryAsyncStep<
+        <S3 as TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        >>::Output,
+        Error,
+    >>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.tail.head.call(input).await?;
+            let carried = self.tail.tail.head.call(carried).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, Input, Error> TryAsyncChainSend<Input, Error>
+    for TryAsyncPipe<
+        S5,
+        TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>,
+    >
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>:
+        Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        > + Send,
+    for<'a> <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+        Error,
+    >>::Future<'a>: Send,
+    <S3 as TryAsyncStep<
+        <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+        Error,
+    >>::Output: Send,
+    S4: TryAsyncStep<
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+                Error,
+            >>::Output,
+            Error,
+        > + Send,
+    for<'a> <S4 as TryAsyncStep<
+        <S3 as TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        >>::Output,
+        Error,
+    >>::Future<'a>: Send,
+    <S4 as TryAsyncStep<
+        <S3 as TryAsyncStep<
+            <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+            Error,
+        >>::Output,
+        Error,
+    >>::Output: Send,
+    S5: TryAsyncStep<
+            <S4 as TryAsyncStep<
+                <S3 as TryAsyncStep<
+                    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+                    Error,
+                >>::Output,
+                Error,
+            >>::Output,
+            Error,
+        > + Send,
+    for<'a> <S5 as TryAsyncStep<
+        <S4 as TryAsyncStep<
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+                Error,
+            >>::Output,
+            Error,
+        >>::Output,
+        Error,
+    >>::Future<'a>: Send,
+    <S5 as TryAsyncStep<
+        <S4 as TryAsyncStep<
+            <S3 as TryAsyncStep<
+                <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output,
+                Error,
+            >>::Output,
+            Error,
+        >>::Output,
+        Error,
+    >>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.head.call(input).await?;
+            let carried = self.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.head.call(carried).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, Input, Error> TryAsyncChainSend<Input, Error> for TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>>>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>: Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.head.call(input).await?;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.head.call(carried).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, S7, Input, Error> TryAsyncChainSend<Input, Error> for TryAsyncPipe<S7, TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>>>>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>: Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S7: TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.tail.head.call(input).await?;
+            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.head.call(carried).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, S7, S8, Input, Error> TryAsyncChainSend<Input, Error> for TryAsyncPipe<S8, TryAsyncPipe<S7, TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, End>>>>>>>>
+where
+    S1: TryAsyncStep<Input, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<Input, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<Input, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Future<'a>: Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S7: TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S8: TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S8 as TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S8 as TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(input).await?;
+            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.head.call(carried).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input, Error> TryAsyncChainSend<Input, Error> for TryAsyncPipe<S8, TryAsyncPipe<S7, TryAsyncPipe<S6, TryAsyncPipe<S5, TryAsyncPipe<S4, TryAsyncPipe<S3, TryAsyncPipe<S2, TryAsyncPipe<S1, TryAsyncPipe<TailHead, TailTail>>>>>>>>>
+where
+    TryAsyncPipe<TailHead, TailTail>: TryAsyncChainSend<Input, Error> + Send,
+    <TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output: Send,
+    S1: TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error> + Send,
+    for<'a> <S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Future<'a>: Send,
+    <S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output: Send,
+    S2: TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S3: TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S4: TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S5: TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S6: TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S7: TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    S8: TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error> + Send,
+    for<'a> <S8 as TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Future<'a>: Send,
+    <S8 as TryAsyncStep<<S7 as TryAsyncStep<<S6 as TryAsyncStep<<S5 as TryAsyncStep<<S4 as TryAsyncStep<<S3 as TryAsyncStep<<S2 as TryAsyncStep<<S1 as TryAsyncStep<<TryAsyncPipe<TailHead, TailTail> as TryAsyncChain<Input, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output, Error>>::Output: Send,
+    Input: Send,
+    Error: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Result<Self::Output, Error>> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.tail.tail.tail.run_send(input).await?;
+            let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.tail.head.call(carried).await?;
+            let carried = self.tail.tail.head.call(carried).await?;
+            let carried = self.tail.head.call(carried).await?;
+            self.head.call(carried).await
+        }
     }
 }

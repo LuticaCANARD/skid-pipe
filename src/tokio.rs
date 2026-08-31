@@ -6,7 +6,7 @@
 //! task keeps Tokio's `'static` task boundary explicit without changing the
 //! core pipeline's no-std, allocation-free contract.
 
-use crate::{AsyncChain, TryAsyncChain};
+use crate::{AsyncChain, AsyncChainSend, TryAsyncChain, TryAsyncChainSend};
 
 /// Spawns an infallible async chain on a Tokio runtime.
 ///
@@ -22,14 +22,13 @@ pub trait TokioAsyncChainExt<Input>: AsyncChain<Input> + Sized {
     #[inline]
     fn spawn(self, input: Input) -> tokio::task::JoinHandle<Self::Output>
     where
-        Self: Send + 'static,
+        Self: AsyncChainSend<Input> + Send + 'static,
         Input: Send + 'static,
         Self::Output: Send + 'static,
-        for<'a> Self::Future<'a>: Send,
     {
         tokio::spawn(async move {
             let mut pipeline = self;
-            AsyncChain::run(&mut pipeline, input).await
+            AsyncChainSend::run_send(&mut pipeline, input).await
         })
     }
 
@@ -64,15 +63,14 @@ pub trait TokioTryAsyncChainExt<Input, Error>: TryAsyncChain<Input, Error> + Siz
     #[inline]
     fn spawn(self, input: Input) -> tokio::task::JoinHandle<Result<Self::Output, Error>>
     where
-        Self: Send + 'static,
+        Self: TryAsyncChainSend<Input, Error> + Send + 'static,
         Input: Send + 'static,
         Error: Send + 'static,
         Self::Output: Send + 'static,
-        for<'a> Self::Future<'a>: Send,
     {
         tokio::spawn(async move {
             let mut pipeline = self;
-            TryAsyncChain::run(&mut pipeline, input).await
+            TryAsyncChainSend::run_send(&mut pipeline, input).await
         })
     }
 

@@ -1,19 +1,12 @@
 use core::future::Future;
 
-use crate::{
-    AsyncStart, End, FirstStageFuture, ThenFuture, ThenOctFuture, ThenPairFuture, ThenQuadFuture,
-};
-
-type StepOutput<Step, Input> = <Step as AsyncStep<Input>>::Output;
-type ChainOutput<Chain, Input> = <Chain as AsyncChain<Input>>::Output;
+use crate::End;
 
 /// A reusable, statically typed asynchronous function pipeline.
 ///
 /// Each stage returns a [`Future`]. [`AsyncPipe::run`] returns the composed
 /// future without allocating, polling it, or selecting an executor.
 pub struct AsyncPipe<Head, Tail = End> {
-    // `crate::future` projects these to reach one stage at a time from a
-    // single stored pipeline pointer.
     pub(crate) head: Head,
     pub(crate) tail: Tail,
 }
@@ -39,17 +32,9 @@ impl<Head, Tail> AsyncPipe<Head, Tail> {
     /// Returns a future that runs every stage from left to right.
     ///
     /// The caller selects where and how that future is polled. Creating the
-    /// future is lazy: no stage runs until the future is first polled.
-    /// Construction is still not free, because it writes one pipeline pointer
-    /// and one state tag per group of eight stages, so an unpolled or
-    /// immediately dropped run costs `O(stages / 8)` stores. The mutable
-    /// receiver permits `FnMut` stages to retain state between completed runs.
-    /// The returned future holds the mutable pipeline borrow until it is
-    /// completed or dropped, so one pipeline instance cannot have overlapping
-    /// runs. Dropping an incomplete future cancels that run and releases the
-    /// borrow; state changes already made by a polled stage are not rolled back.
-    /// To satisfy a `tokio::spawn`-style `Send + 'static` boundary, move the
-    /// pipeline into an `async move` task and call `run` inside that task.
+    /// future is lazy: no stage runs until the future is first polled. The
+    /// returned future holds the mutable pipeline borrow until it is completed
+    /// or dropped, so one pipeline instance cannot have overlapping runs.
     ///
     /// ```compile_fail
     /// use skid_pipe::AsyncPipe;
@@ -60,7 +45,10 @@ impl<Head, Tail> AsyncPipe<Head, Tail> {
     /// drop((first, second));
     /// ```
     #[inline(always)]
-    pub fn run<Input>(&mut self, input: Input) -> <Self as AsyncChain<Input>>::Future<'_>
+    pub fn run<Input>(
+        &mut self,
+        input: Input,
+    ) -> impl Future<Output = <Self as AsyncChain<Input>>::Output>
     where
         Self: AsyncChain<Input>,
     {
@@ -107,159 +95,115 @@ where
 /// A complete asynchronous pipeline, runnable for one input value.
 ///
 /// [`AsyncPipe`] implements this trait; it is the recursive engine behind
-/// [`AsyncPipe::run`]. It is public so builder
-/// functions can return `impl AsyncChain<Input, Output = O>` and hide the
-/// recursive concrete pipeline type at zero cost.
+/// [`AsyncPipe::run`]. It is public so builder functions can return
+/// `impl AsyncChain<Input, Output = O>` and hide the recursive concrete
+/// pipeline type at zero cost.
 ///
-/// `run` returns the concrete associated [`AsyncChain::Future`], keeping
-/// execution allocation-free.
+/// `async fn` here cannot name an auto trait bound. [`AsyncChainSend`] restates
+/// the same composition with `Send` promised, for callers that must prove it.
+#[allow(async_fn_in_trait)]
 pub trait AsyncChain<Input>: Sized {
     /// The value emitted when this chain's future resolves.
     type Output;
 
-    /// The concrete future created by this chain.
-    type Future<'a>: Future<Output = Self::Output>
-    where
-        Self: 'a;
-
     /// Creates the future that runs this chain.
-    fn run(&mut self, input: Input) -> Self::Future<'_>;
+    async fn run(&mut self, input: Input) -> Self::Output;
 }
 
-impl<Head, Input> AsyncChain<Input> for AsyncPipe<Head, End>
+impl<S1, Input> AsyncChain<Input> for AsyncPipe<S1, End>
 where
-    Head: AsyncStep<Input>,
+    S1: AsyncStep<Input>,
 {
-    type Output = Head::Output;
-    type Future<'a>
-        = FirstStageFuture<'a, AsyncStart, Head, Input, Head::Future<'a>>
-    where
-        Self: 'a;
+    type Output = <S1 as AsyncStep<Input>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        FirstStageFuture::new(&mut self.head, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        self.head.call(input).await
     }
 }
 
 impl<S1, S2, Input> AsyncChain<Input> for AsyncPipe<S2, AsyncPipe<S1, End>>
 where
-    AsyncPipe<S1, End>: AsyncChain<Input>,
-    S2: AsyncStep<ChainOutput<AsyncPipe<S1, End>, Input>>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
 {
-    type Output = StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>;
-    type Future<'a>
-        = ThenFuture<
-        'a,
-        Self,
-        Input,
-        <AsyncPipe<S1, End> as AsyncChain<Input>>::Future<'a>,
-        <S2 as AsyncStep<ChainOutput<AsyncPipe<S1, End>, Input>>>::Future<'a>,
-    >
-    where
-        Self: 'a;
+    type Output = <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self.tail.head.call(input).await;
+        self.head.call(carried).await
     }
 }
 
 impl<S1, S2, S3, Input> AsyncChain<Input> for AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>
 where
-    AsyncPipe<S1, End>: AsyncChain<Input>,
-    S2: AsyncStep<ChainOutput<AsyncPipe<S1, End>, Input>>,
-    S3: AsyncStep<StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
 {
-    type Output = StepOutput<S3, StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>;
-    type Future<'a>
-        = ThenPairFuture<
-        'a,
-        Self,
-        Input,
-        <AsyncPipe<S1, End> as AsyncChain<Input>>::Future<'a>,
-        <S2 as AsyncStep<ChainOutput<AsyncPipe<S1, End>, Input>>>::Future<'a>,
-        <S3 as AsyncStep<StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>>::Future<'a>,
-    >
-    where
-        Self: 'a;
+    type Output =
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenPairFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self.tail.tail.head.call(input).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
     }
 }
 
 impl<S1, S2, S3, S4, Input> AsyncChain<Input>
     for AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>
 where
-    AsyncPipe<S2, AsyncPipe<S1, End>>: AsyncChain<Input>,
-    S3: AsyncStep<ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>,
-    S4: AsyncStep<StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
+    S4: AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >,
 {
-    type Output =
-        StepOutput<S4, StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>;
-    type Future<'a>
-        =
-        ThenPairFuture<
-            'a,
-            Self,
-            Input,
-            <AsyncPipe<S2, AsyncPipe<S1, End>> as AsyncChain<Input>>::Future<'a>,
-            <S3 as AsyncStep<ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>::Future<'a>,
-            <S4 as AsyncStep<
-                StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>,
-            >>::Future<'a>,
-        >
-    where
-        Self: 'a;
+    type Output = <S4 as AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenPairFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self.tail.tail.tail.head.call(input).await;
+        let carried = self.tail.tail.head.call(carried).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
     }
 }
 
 impl<S1, S2, S3, S4, S5, Input> AsyncChain<Input>
     for AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>
 where
-    AsyncPipe<S1, End>: AsyncChain<Input>,
-    S2: AsyncStep<ChainOutput<AsyncPipe<S1, End>, Input>>,
-    S3: AsyncStep<StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>,
-    S4: AsyncStep<StepOutput<S3, StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
+    S4: AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >,
     S5: AsyncStep<
-        StepOutput<S4, StepOutput<S3, StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>>,
+        <S4 as AsyncStep<
+            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+        >>::Output,
     >,
 {
-    type Output = StepOutput<
-        S5,
-        StepOutput<S4, StepOutput<S3, StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>>,
-    >;
-    type Future<'a>
-        =
-        ThenQuadFuture<
-            'a,
-            Self,
-            Input,
-            <AsyncPipe<S1, End> as AsyncChain<Input>>::Future<'a>,
-            <S2 as AsyncStep<ChainOutput<AsyncPipe<S1, End>, Input>>>::Future<'a>,
-            <S3 as AsyncStep<StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>>::Future<'a>,
-            <S4 as AsyncStep<
-                StepOutput<S3, StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>,
-            >>::Future<'a>,
-            <S5 as AsyncStep<
-                StepOutput<
-                    S4,
-                    StepOutput<S3, StepOutput<S2, ChainOutput<AsyncPipe<S1, End>, Input>>>,
-                >,
-            >>::Future<'a>,
-        >
-    where
-        Self: 'a;
+    type Output = <S5 as AsyncStep<
+        <S4 as AsyncStep<
+            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+        >>::Output,
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self.tail.tail.tail.tail.head.call(input).await;
+        let carried = self.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.head.call(carried).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
     }
 }
 
@@ -269,59 +213,47 @@ impl<S1, S2, S3, S4, S5, S6, Input> AsyncChain<Input>
         AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>,
     >
 where
-    AsyncPipe<S2, AsyncPipe<S1, End>>: AsyncChain<Input>,
-    S3: AsyncStep<ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>,
-    S4: AsyncStep<StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
+    S4: AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >,
     S5: AsyncStep<
-        StepOutput<S4, StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>,
+        <S4 as AsyncStep<
+            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+        >>::Output,
     >,
-    S6: AsyncStep<
-        StepOutput<
-            S5,
-            StepOutput<S4, StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>,
-        >,
-    >,
-{
-    type Output = StepOutput<
-        S6,
-        StepOutput<
-            S5,
-            StepOutput<S4, StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>,
-        >,
-    >;
-    type Future<'a>
-        =
-        ThenQuadFuture<
-            'a,
-            Self,
-            Input,
-            <AsyncPipe<S2, AsyncPipe<S1, End>> as AsyncChain<Input>>::Future<'a>,
-            <S3 as AsyncStep<ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>>::Future<'a>,
-            <S4 as AsyncStep<
-                StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>,
-            >>::Future<'a>,
+    S6:
+        AsyncStep<
             <S5 as AsyncStep<
-                StepOutput<
-                    S4,
-                    StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>,
-                >,
-            >>::Future<'a>,
-            <S6 as AsyncStep<
-                StepOutput<
-                    S5,
-                    StepOutput<
-                        S4,
-                        StepOutput<S3, ChainOutput<AsyncPipe<S2, AsyncPipe<S1, End>>, Input>>,
-                    >,
-                >,
-            >>::Future<'a>,
-        >
-    where
-        Self: 'a;
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >,
+{
+    type Output =
+        <S6 as AsyncStep<
+            <S5 as AsyncStep<
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self.tail.tail.tail.tail.tail.head.call(input).await;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.head.call(carried).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
     }
 }
 
@@ -334,87 +266,60 @@ impl<S1, S2, S3, S4, S5, S6, S7, Input> AsyncChain<Input>
         >,
     >
 where
-    AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>: AsyncChain<Input>,
-    S4: AsyncStep<ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
+    S4: AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >,
     S5: AsyncStep<
-        StepOutput<S4, ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>>,
+        <S4 as AsyncStep<
+            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+        >>::Output,
     >,
-    S6: AsyncStep<
-        StepOutput<
-            S5,
-            StepOutput<S4, ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>>,
+    S6:
+        AsyncStep<
+            <S5 as AsyncStep<
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
         >,
-    >,
     S7: AsyncStep<
-        StepOutput<
-            S6,
-            StepOutput<
-                S5,
-                StepOutput<
-                    S4,
-                    ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>,
-                >,
-            >,
-        >,
+        <S6 as AsyncStep<
+            <S5 as AsyncStep<
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
 {
-    type Output = StepOutput<
-        S7,
-        StepOutput<
-            S6,
-            StepOutput<
-                S5,
-                StepOutput<
-                    S4,
-                    ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>,
-                >,
-            >,
-        >,
-    >;
-    type Future<'a>
-        =
-        ThenQuadFuture<
-            'a,
-            Self,
-            Input,
-            <AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>> as AsyncChain<Input>>::Future<'a>,
-            <S4 as AsyncStep<
-                ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>,
-            >>::Future<'a>,
+    type Output = <S7 as AsyncStep<
+        <S6 as AsyncStep<
             <S5 as AsyncStep<
-                StepOutput<
-                    S4,
-                    ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>,
-                >,
-            >>::Future<'a>,
-            <S6 as AsyncStep<
-                StepOutput<
-                    S5,
-                    StepOutput<
-                        S4,
-                        ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>,
-                    >,
-                >,
-            >>::Future<'a>,
-            <S7 as AsyncStep<
-                StepOutput<
-                    S6,
-                    StepOutput<
-                        S5,
-                        StepOutput<
-                            S4,
-                            ChainOutput<AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>, Input>,
-                        >,
-                    >,
-                >,
-            >>::Future<'a>,
-        >
-    where
-        Self: 'a;
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self.tail.tail.tail.tail.tail.tail.head.call(input).await;
+        let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.head.call(carried).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
     }
 }
 
@@ -430,112 +335,86 @@ impl<S1, S2, S3, S4, S5, S6, S7, S8, Input> AsyncChain<Input>
         >,
     >
 where
-    AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>: AsyncChain<Input>,
+    S1: AsyncStep<Input>,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
+    S4: AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >,
     S5: AsyncStep<
-        ChainOutput<AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>, Input>,
+        <S4 as AsyncStep<
+            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+        >>::Output,
     >,
-    S6: AsyncStep<
-        StepOutput<
-            S5,
-            ChainOutput<AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>, Input>,
+    S6:
+        AsyncStep<
+            <S5 as AsyncStep<
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
         >,
-    >,
     S7: AsyncStep<
-        StepOutput<
-            S6,
-            StepOutput<
-                S5,
-                ChainOutput<AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>, Input>,
-            >,
-        >,
+        <S6 as AsyncStep<
+            <S5 as AsyncStep<
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
     S8: AsyncStep<
-        StepOutput<
-            S7,
-            StepOutput<
-                S6,
-                StepOutput<
-                    S5,
-                    ChainOutput<
-                        AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>,
-                        Input,
-                    >,
-                >,
-            >,
-        >,
+        <S7 as AsyncStep<
+            <S6 as AsyncStep<
+                <S5 as AsyncStep<
+                    <S4 as AsyncStep<
+                        <S3 as AsyncStep<
+                            <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                        >>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
 {
-    type Output = StepOutput<
-        S8,
-        StepOutput<
-            S7,
-            StepOutput<
-                S6,
-                StepOutput<
-                    S5,
-                    ChainOutput<
-                        AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>,
-                        Input,
-                    >,
-                >,
-            >,
-        >,
-    >;
-    type Future<'a>
-        =
-        ThenQuadFuture<
-            'a,
-            Self,
-            Input,
-            <AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>> as AsyncChain<
-                Input,
-            >>::Future<'a>,
-            <S5 as AsyncStep<
-                ChainOutput<AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>, Input>,
-            >>::Future<'a>,
+    type Output = <S8 as AsyncStep<
+        <S7 as AsyncStep<
             <S6 as AsyncStep<
-                StepOutput<
-                    S5,
-                    ChainOutput<
-                        AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>,
-                        Input,
-                    >,
-                >,
-            >>::Future<'a>,
-            <S7 as AsyncStep<
-                StepOutput<
-                    S6,
-                    StepOutput<
-                        S5,
-                        ChainOutput<
-                            AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>,
-                            Input,
-                        >,
-                    >,
-                >,
-            >>::Future<'a>,
-            <S8 as AsyncStep<
-                StepOutput<
-                    S7,
-                    StepOutput<
-                        S6,
-                        StepOutput<
-                            S5,
-                            ChainOutput<
-                                AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>,
-                                Input,
-                            >,
-                        >,
-                    >,
-                >,
-            >>::Future<'a>,
-        >
-    where
-        Self: 'a;
+                <S5 as AsyncStep<
+                    <S4 as AsyncStep<
+                        <S3 as AsyncStep<
+                            <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
+                        >>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenQuadFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .head
+            .call(input)
+            .await;
+        let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.head.call(carried).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
     }
 }
 
@@ -558,110 +437,454 @@ impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input> AsyncChain<Input
     >
 where
     AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,
-    S1: AsyncStep<ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>,
-    S2: AsyncStep<StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>,
+    S1: AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>,
+    S2: AsyncStep<
+        <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output,
+    >,
     S3: AsyncStep<
-        StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>,
+        <S2 as AsyncStep<
+            <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output,
+        >>::Output,
     >,
-    S4: AsyncStep<
-        StepOutput<
-            S3,
-            StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>,
+    S4:
+        AsyncStep<
+            <S3 as AsyncStep<
+                <S2 as AsyncStep<
+                    <S1 as AsyncStep<
+                        <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
         >,
-    >,
     S5: AsyncStep<
-        StepOutput<
-            S4,
-            StepOutput<
-                S3,
-                StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>,
-            >,
-        >,
+        <S4 as AsyncStep<
+            <S3 as AsyncStep<
+                <S2 as AsyncStep<
+                    <S1 as AsyncStep<
+                        <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
     S6: AsyncStep<
-        StepOutput<
-            S5,
-            StepOutput<
-                S4,
-                StepOutput<
-                    S3,
-                    StepOutput<
-                        S2,
-                        StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>,
-                    >,
-                >,
-            >,
-        >,
+        <S5 as AsyncStep<
+            <S4 as AsyncStep<
+                <S3 as AsyncStep<
+                    <S2 as AsyncStep<
+                        <S1 as AsyncStep<
+                            <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
+                        >>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
     S7: AsyncStep<
-        StepOutput<
-            S6,
-            StepOutput<
-                S5,
-                StepOutput<
-                    S4,
-                    StepOutput<
-                        S3,
-                        StepOutput<
-                            S2,
-                            StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>,
-                        >,
-                    >,
-                >,
-            >,
-        >,
+        <S6 as AsyncStep<
+            <S5 as AsyncStep<
+                <S4 as AsyncStep<
+                    <S3 as AsyncStep<
+                        <S2 as AsyncStep<
+                            <S1 as AsyncStep<
+                                <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
+                            >>::Output,
+                        >>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
     S8: AsyncStep<
-        StepOutput<
-            S7,
-            StepOutput<
-                S6,
-                StepOutput<
-                    S5,
-                    StepOutput<
-                        S4,
-                        StepOutput<
-                            S3,
-                            StepOutput<
-                                S2,
-                                StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>,
-                            >,
-                        >,
-                    >,
-                >,
-            >,
-        >,
+        <S7 as AsyncStep<
+            <S6 as AsyncStep<
+                <S5 as AsyncStep<
+                    <S4 as AsyncStep<
+                        <S3 as AsyncStep<
+                            <S2 as AsyncStep<
+                                <S1 as AsyncStep<
+                                    <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
+                                >>::Output,
+                            >>::Output,
+                        >>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
     >,
 {
-    type Output = StepOutput<
-        S8,
-        StepOutput<
-            S7,
-            StepOutput<
-                S6,
-                StepOutput<
-                    S5,
-                    StepOutput<
-                        S4,
-                        StepOutput<
-                            S3,
-                            StepOutput<
-                                S2,
-                                StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>,
-                            >,
-                        >,
-                    >,
-                >,
-            >,
-        >,
-    >;
-    type Future<'a>
-        = ThenOctFuture<'a, Self, Input, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Future<'a>, <S1 as AsyncStep<ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>::Future<'a>, <S2 as AsyncStep<StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>::Future<'a>, <S3 as AsyncStep<StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>>::Future<'a>, <S4 as AsyncStep<StepOutput<S3, StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>>>::Future<'a>, <S5 as AsyncStep<StepOutput<S4, StepOutput<S3, StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>>>>::Future<'a>, <S6 as AsyncStep<StepOutput<S5, StepOutput<S4, StepOutput<S3, StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>>>>>::Future<'a>, <S7 as AsyncStep<StepOutput<S6, StepOutput<S5, StepOutput<S4, StepOutput<S3, StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>>>>>>::Future<'a>, <S8 as AsyncStep<StepOutput<S7, StepOutput<S6, StepOutput<S5, StepOutput<S4, StepOutput<S3, StepOutput<S2, StepOutput<S1, ChainOutput<AsyncPipe<TailHead, TailTail>, Input>>>>>>>>>>::Future<'a>>
-    where
-        Self: 'a;
+    type Output = <S8 as AsyncStep<
+        <S7 as AsyncStep<
+            <S6 as AsyncStep<
+                <S5 as AsyncStep<
+                    <S4 as AsyncStep<
+                        <S3 as AsyncStep<
+                            <S2 as AsyncStep<
+                                <S1 as AsyncStep<
+                                    <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
+                                >>::Output,
+                            >>::Output,
+                        >>::Output,
+                    >>::Output,
+                >>::Output,
+            >>::Output,
+        >>::Output,
+    >>::Output;
 
     #[inline(always)]
-    fn run(&mut self, input: Input) -> Self::Future<'_> {
-        ThenOctFuture::new(self, input)
+    async fn run(&mut self, input: Input) -> Self::Output {
+        let carried = self
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .run(input)
+            .await;
+        let carried = self
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .tail
+            .head
+            .call(carried)
+            .await;
+        let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.tail.head.call(carried).await;
+        let carried = self.tail.tail.head.call(carried).await;
+        let carried = self.tail.head.call(carried).await;
+        self.head.call(carried).await
+    }
+}
+
+/// The `Send` variant of [`AsyncChain`].
+///
+/// [`AsyncChain::run`] returns an unnameable `impl Future`, so a caller that
+/// must prove the composed future is `Send` (a `tokio::spawn` boundary) cannot
+/// write that bound. This trait restates the same composition with `Send`
+/// promised in the return type. A stage future stays nameable through
+/// [`AsyncStep::Future`], so its bound is expressible here.
+pub trait AsyncChainSend<Input>: AsyncChain<Input> {
+    /// Creates the future that runs this chain, promising `Send`.
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send;
+}
+
+impl<S1, Input> AsyncChainSend<Input> for AsyncPipe<S1, End>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move { self.head.call(input).await }
+    }
+}
+
+impl<S1, S2, Input> AsyncChainSend<Input> for AsyncPipe<S2, AsyncPipe<S1, End>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.head.call(input).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, Input> AsyncChainSend<Input> for AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>:
+        Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.head.call(input).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, Input> AsyncChainSend<Input>
+    for AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>:
+        Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
+    S4: AsyncStep<
+            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+        > + Send,
+    for<'a> <S4 as AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >>::Future<'a>: Send,
+    <S4 as AsyncStep<
+        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
+    >>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.tail.head.call(input).await;
+            let carried = self.tail.tail.head.call(carried).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, Input> AsyncChainSend<Input> for AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
+    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
+    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.head.call(input).await;
+            let carried = self.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.head.call(carried).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, Input> AsyncChainSend<Input> for AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
+    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
+    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.head.call(input).await;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.head.call(carried).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, S7, Input> AsyncChainSend<Input> for AsyncPipe<S7, AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
+    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
+    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S7: AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.tail.head.call(input).await;
+            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.head.call(carried).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, S7, S8, Input> AsyncChainSend<Input> for AsyncPipe<S8, AsyncPipe<S7, AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>>>>
+where
+    S1: AsyncStep<Input> + Send,
+    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
+    <S1 as AsyncStep<Input>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
+    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
+    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S7: AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S8: AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(input).await;
+            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.head.call(carried).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
+    }
+}
+
+impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input> AsyncChainSend<Input> for AsyncPipe<S8, AsyncPipe<S7, AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, AsyncPipe<TailHead, TailTail>>>>>>>>>
+where
+    AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send,
+    <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,
+    S1: AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output> + Send,
+    for<'a> <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Future<'a>: Send,
+    <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output: Send,
+    S2: AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output> + Send,
+    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Future<'a>: Send,
+    <S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output: Send,
+    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output: Send,
+    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S7: AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    S8: AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
+    for<'a> <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
+    <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
+    Input: Send,
+{
+    // `async fn` cannot promise `+ Send` in its return type, which is the
+    // entire reason this trait exists beside the plain one.
+    #[allow(clippy::manual_async_fn)]
+    #[inline(always)]
+    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
+        async move {
+            let carried = self.tail.tail.tail.tail.tail.tail.tail.tail.run_send(input).await;
+            let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.tail.head.call(carried).await;
+            let carried = self.tail.tail.head.call(carried).await;
+            let carried = self.tail.head.call(carried).await;
+            self.head.call(carried).await
+        }
     }
 }

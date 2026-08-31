@@ -8,6 +8,61 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ## [Unreleased]
 
+## [0.3.0] - unreleased
+
+Async sequencing is now written as `async` blocks instead of hand-written state
+machines, so the crate contains no `unsafe` code at all. The composition shape
+is unchanged: arities one to eight terminate on `End` and longer chains fold
+eight stages at a time, exactly as the removed machines did.
+
+### Removed
+
+- Removed `src/future.rs` and the futures it exported (`FirstStageFuture`,
+  `ThenFuture`, `ThenPairFuture`, `ThenQuadFuture`, `ThenOctFuture`, their
+  fallible twins, `AsyncStart`, `TryStart` and `StartStep`). All were
+  `#[doc(hidden)]`.
+- Removed the `lazy-construction` feature. Construction is now free
+  unconditionally — an `async` block runs nothing until its first poll — so
+  creating a 100-stage run future costs 0.885 ns rather than 7.02 ns, without
+  the first-error regression the feature traded for.
+
+### Changed
+
+- **Breaking.** `AsyncChain::Future` and `TryAsyncChain::Future` are gone;
+  `run` returns `impl Future` in the trait instead. `impl Trait` in associated
+  types is still unstable, so the associated type could not be kept. Code that
+  calls `run` and awaits it is unaffected; code that named the associated type
+  must stop naming it.
+- The crate is `#![forbid(unsafe_code)]` rather than denying unsafe outside one
+  sanctioned module.
+- `AsyncStep::Future` and `TryAsyncStep::Future` are unchanged. A stage's
+  future stays nameable, which is what lets the `Send` bounds below exist.
+
+### Added
+
+- Added `AsyncChainSend` and `TryAsyncChainSend`. A return-position `impl
+  Future` in a trait does not leak `Send` across a generic bound, so
+  `TokioAsyncChainExt::spawn` could no longer prove the composed future is
+  `Send`. These restate the composition with `Send` promised in the return
+  type; `spawn_local` still accepts non-`Send` stages through the plain traits.
+
+### Performance
+
+Measured on one machine against 0.2.1; BENCHMARKS.md carries the tables.
+Shorter chains and embedded footprint improve, deep chains regress.
+
+- Flash for `tests/fixtures/no_std` at `opt-level = "z"` drops 36% on
+  `thumbv7em-none-eabihf` (10,375 B to 6,651 B) and 21% on
+  `thumbv6m-none-eabi`.
+- An eight-stage run future drops from 64 B to 24 B: the compiler overlaps a
+  group's stage futures into one slot.
+- The three-stage `TryAsyncPipe` success row drops from 20.820 ns to 11.270 ns;
+  the three-stage `AsyncPipe` one rises from 5.2975 ns to 9.0845 ns.
+- The 100-stage rows regress 18% to 25%, and the 100-stage first-error
+  short-circuit from 23.744 ns to 32.089 ns.
+- A chain longer than 127 stages now needs `#![recursion_limit]` raised in the
+  calling crate. The crate's own 100-stage tests compile without it.
+
 ## [0.2.1] - 2026-08-24
 
 ### Added
@@ -185,6 +240,8 @@ No code migration is required from 0.1.0.
   the minimum supported Rust version (MSRV).
 
 [Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
+[0.3.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
+[0.3.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.1...v0.1.2
