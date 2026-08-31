@@ -176,14 +176,8 @@
 //! let _ = pipeline.run(1_u8);
 //! ```
 
-/// Walks `.tail` once per stage below the one being reached.
-///
-/// Shared by both ladders: it never names a pipeline type, only the `tail`
-/// field both of them have.
-macro_rules! chain_at {
-    ($this:expr;) => { $this };
-    ($this:expr; $s:ident $($rest:ident)*) => { chain_at!($this.tail; $($rest)*) };
-}
+#[macro_use]
+mod ladder;
 
 mod async_pipe;
 mod pipe;

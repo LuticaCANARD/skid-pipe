@@ -110,160 +110,50 @@ pub trait AsyncChain<Input>: Sized {
     fn run(&mut self, input: Input) -> impl Future<Output = Self::Output>;
 }
 
-// The impl ladders below are mechanical: one impl per arity up to 16, then one
-// that folds 16 stages over any shorter chain. They are macros because arity is
-// this crate's main performance lever — a group's stages share one `async`
-// block and rustc overlaps their futures into a single slot, so a wider group
-// means a flatter, smaller future. Widening is adding invocation lines.
+// The ladder below is written by the shared accumulators in `ladder.rs`.
+// Arity is this crate's main performance lever — a group's stages share one
+// `async` block and rustc overlaps their futures into a single slot — so
+// widening is adding invocation lines.
 
-/// Folds a stage list into the nested pipeline type it names.
-macro_rules! async_chain_ty {
-    ($bottom:ty;) => { $bottom };
-    ($bottom:ty; $s:ident $($rest:ident)*) => { async_chain_ty!(AsyncPipe<$s, $bottom>; $($rest)*) };
-}
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
-/// Emits one `AsyncChain` impl per invocation.
-///
-/// One pass accumulates everything the impl needs: `$cur` is the input type the
-/// next stage sees, so the bounds fall out in order; `$fwd` keeps the stages
-/// innermost-first for the type; `$body` collects the run body as statements.
-/// The body is accumulated rather than recursed into so every `let` lands in a
-/// single expansion — one hygiene context, so each stage's future is a
-/// temporary that dies at its own statement and rustc overlaps them into one
-/// slot, and an early `?` returns from one scope rather than 16.
-macro_rules! async_chain_impls {
-    (rest $($s:ident)+) => {
-        async_chain_impls!(@rest
-            [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output]
-            [AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,]
-            []
-            this input carried
-            [let carried = chain_at!(this; $($s)*).run(input).await;]
-            $($s)+);
-    };
-    ($($s:ident)+) => {
-        async_chain_impls!(@end [Input] [] [] this input carried
-            [let carried = input;] $($s)+);
-    };
-
-    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
-        async_chain_impls!(@end
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur>,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = chain_at!($this; $($rest)+).head.call($car).await;]
-            $($rest)+);
-    };
-    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
-        async_chain_impls!(@end
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur>,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = $this.head.call($car).await;]);
-    };
-    (@end [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
-        impl<$($fwd,)* Input> AsyncChain<Input> for async_chain_ty!(End; $($fwd)*)
-        where
-            $($b)*
-        {
-            type Output = $out;
-
-            #[inline(always)]
-            #[allow(clippy::manual_async_fn)]
-            fn run(&mut self, $inp: Input) -> impl Future<Output = Self::Output> {
-                let $this = self;
-                async move {
-                    $($body)*
-                    $car
-                }
-            }
-        }
-    };
-
-    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
-        async_chain_impls!(@rest
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur>,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = chain_at!($this; $($rest)+).head.call($car).await;]
-            $($rest)+);
-    };
-    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
-        async_chain_impls!(@rest
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur>,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = $this.head.call($car).await;]);
-    };
-    (@rest [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
-        impl<$($fwd,)* TailHead, TailTail, Input> AsyncChain<Input> for async_chain_ty!(AsyncPipe<TailHead, TailTail>; $($fwd)*)
-        where
-            $($b)*
-        {
-            type Output = $out;
-
-            #[inline(always)]
-            #[allow(clippy::manual_async_fn)]
-            fn run(&mut self, $inp: Input) -> impl Future<Output = Self::Output> {
-                let $this = self;
-                async move {
-                    $($body)*
-                    $car
-                }
-            }
-        }
-    };
-
-}
-
-async_chain_impls!(S1);
-async_chain_impls!(S1 S2);
-async_chain_impls!(S1 S2 S3);
-async_chain_impls!(S1 S2 S3 S4);
-async_chain_impls!(S1 S2 S3 S4 S5);
-async_chain_impls!(S1 S2 S3 S4 S5 S6);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
-async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
-
-// Without `wide`, groups of 16 fold over anything longer.
 #[cfg(not(feature = "wide"))]
-async_chain_impls!(rest S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
+ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
-// With it the ladder runs to 32 and folds 32 at a time: a 100-stage chain
-// costs 364.11 ns rather than 385, its run future 72 B rather than 120 B, at
-// roughly five times the crate's own compile time. Turning it on anywhere
-// turns it on for everyone, which is what keeps the feature additive.
 #[cfg(feature = "wide")]
 const _: () = {
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31);
-    async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
-    async_chain_impls!(rest S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
+    ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
 };
 
 /// The `Send` variant of [`AsyncChain`].
@@ -278,142 +168,43 @@ pub trait AsyncChainSend<Input>: AsyncChain<Input> {
     fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send;
 }
 
-/// Emits one `AsyncChainSend` impl per invocation.
-///
-/// One pass accumulates everything the impl needs: `$cur` is the input type the
-/// next stage sees, so the bounds fall out in order; `$fwd` keeps the stages
-/// innermost-first for the type; `$body` collects the run body as statements.
-/// The body is accumulated rather than recursed into so every `let` lands in a
-/// single expansion — one hygiene context, so each stage's future is a
-/// temporary that dies at its own statement and rustc overlaps them into one
-/// slot, and an early `?` returns from one scope rather than 16.
-macro_rules! async_chain_send_impls {
-    (rest $($s:ident)+) => {
-        async_chain_send_impls!(@rest
-            [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output]
-            [Input: Send, AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,]
-            []
-            this input carried
-            [let carried = chain_at!(this; $($s)*).run_send(input).await;]
-            $($s)+);
-    };
-    ($($s:ident)+) => {
-        async_chain_send_impls!(@end [Input] [Input: Send,] [] this input carried
-            [let carried = input;] $($s)+);
-    };
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
-    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
-        async_chain_send_impls!(@end
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = chain_at!($this; $($rest)+).head.call($car).await;]
-            $($rest)+);
-    };
-    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
-        async_chain_send_impls!(@end
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = $this.head.call($car).await;]);
-    };
-    (@end [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
-        impl<$($fwd,)* Input> AsyncChainSend<Input> for async_chain_ty!(End; $($fwd)*)
-        where
-            $($b)*
-        {
-            #[inline(always)]
-            #[allow(clippy::manual_async_fn)]
-            fn run_send(&mut self, $inp: Input) -> impl Future<Output = Self::Output> + Send {
-                let $this = self;
-                async move {
-                    $($body)*
-                    $car
-                }
-            }
-        }
-    };
-
-    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
-        async_chain_send_impls!(@rest
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = chain_at!($this; $($rest)+).head.call($car).await;]
-            $($rest)+);
-    };
-    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
-        async_chain_send_impls!(@rest
-            [<$s as AsyncStep<$cur>>::Output]
-            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
-            [$($fwd)* $s]
-            $this $inp $car
-            [$($body)* let $car = $this.head.call($car).await;]);
-    };
-    (@rest [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
-        impl<$($fwd,)* TailHead, TailTail, Input> AsyncChainSend<Input> for async_chain_ty!(AsyncPipe<TailHead, TailTail>; $($fwd)*)
-        where
-            $($b)*
-        {
-            #[inline(always)]
-            #[allow(clippy::manual_async_fn)]
-            fn run_send(&mut self, $inp: Input) -> impl Future<Output = Self::Output> + Send {
-                let $this = self;
-                async move {
-                    $($body)*
-                    $car
-                }
-            }
-        }
-    };
-
-}
-
-async_chain_send_impls!(S1);
-async_chain_send_impls!(S1 S2);
-async_chain_send_impls!(S1 S2 S3);
-async_chain_send_impls!(S1 S2 S3 S4);
-async_chain_send_impls!(S1 S2 S3 S4 S5);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
-async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
-
-// Without `wide`, groups of 16 fold over anything longer.
 #[cfg(not(feature = "wide"))]
-async_chain_send_impls!(rest S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
-// With it the ladder runs to 32 and folds 32 at a time: a 100-stage chain
-// costs 364.11 ns rather than 385, its run future 72 B rather than 120 B, at
-// roughly five times the crate's own compile time. Turning it on anywhere
-// turns it on for everyone, which is what keeps the feature additive.
 #[cfg(feature = "wide")]
 const _: () = {
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31);
-    async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
-    async_chain_send_impls!(rest S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
 };

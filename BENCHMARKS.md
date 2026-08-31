@@ -428,12 +428,16 @@ Flash, `tests/fixtures/no_std` built at `opt-level = "z"`, `.text` totals:
 The fixture's synchronous 100-stage paths are identical in both trees, so the
 async-only saving is larger than these totals show.
 
-The `Send` ladder is a second copy of the composition rather than a delegation
-to the first. `fn run_send(..) -> impl Future<..> + Send { AsyncChain::run(self,
-input) }` is the obvious shrink and does not work: with `AsyncChainSend` taking
-`AsyncChain` as a supertrait, resolving it that way overflows, and raising the
-crate's `recursion_limit` to let it try further segfaults rustc rather than
-finishing. The copies stay.
+The `Send` ladder is a second walk over the composition rather than a
+delegation to the first. `fn run_send(..) -> impl Future<..> + Send {
+AsyncChain::run(self, input) }` is the obvious shrink, and it works for the
+arities that terminate on `End` — but not for the arm that folds a group over
+a shorter chain. Proving that return type is `Send` means looking through
+`run`'s opaque future, which for the folding arm contains the tail chain's own
+opaque future, so the compiler searches `Chain` impls for a generic tail with
+inference variables and recurses until it overflows; raising `recursion_limit`
+to let it search further segfaults rustc instead of finishing. Both walks stay,
+but they share one accumulator.
 
 One limit worth naming: a chain longer than 127 stages now needs
 `#![recursion_limit]` raised in the calling crate, where the hand-written
