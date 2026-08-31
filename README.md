@@ -124,8 +124,8 @@ cargo +1.86 bench --bench composition -- \
 ```
 
 Criterion is a benchmark-only development dependency; the published library's
-default normal dependency graph remains empty. The opt-in `tokio` feature is
-not included in these measurements.
+default normal dependency graph remains empty. Neither the opt-in `tokio`
+feature nor `wide` is included in these measurements.
 
 Treat the resulting nanoseconds as machine-local evidence, not a portable
 performance promise. Flash size, stack use, and assembly require target-specific
@@ -312,13 +312,110 @@ the chain's length. `run` holds the mutable pipeline borrow until its future
 completes or is dropped, so a stateful pipeline instance cannot run
 concurrently. The default core crate does not depend on any executor.
 
+### Tokio feature
+
+Enable the optional integration when the application already uses Tokio:
+
+```toml
+[dependencies]
+skid-pipe = { version = "0.3", features = ["tokio"] }
+```
+
+The feature enables Tokio's minimal `rt` feature and exports two extension
+traits: `TokioAsyncChainExt` and `TokioTryAsyncChainExt`. They move a pipeline
+and one input into a Tokio task, making the required ownership boundary
+explicit. The default feature set remains `no_std`, dependency-free, and free
+of Tokio.
+
+For [`tokio::spawn`](https://docs.rs/tokio/latest/tokio/task/fn.spawn.html),
+import the extension trait and consume the pipeline with `spawn`:
+
+```rust,ignore
+use skid_pipe::{AsyncPipe, TokioAsyncChainExt};
+
+let task = AsyncPipe::new(fetch)
+    .then(classify)
+    .spawn(12);
+```
+
+`spawn` requires the pipeline, input, output, and composed run future to meet
+Tokio's `Send + 'static` boundary. A run future created from a pipeline that
+stays on the caller's stack borrows that pipeline and therefore cannot itself
+be made `'static`.
+
+The composed future is an unnameable `impl Future`, so that `Send` bound cannot
+be written directly. `AsyncChainSend` and `TryAsyncChainSend` restate the same
+composition with `Send` promised in the return type, and `spawn` asks for them.
+Concrete pipelines get them automatically, but a builder that hides its type
+must say so:
+
+```rust,ignore
+use skid_pipe::{AsyncChain, AsyncChainSend, AsyncPipe};
+
+fn build() -> impl AsyncChain<u8, Output = bool> + AsyncChainSend<u8> {
+    AsyncPipe::new(fetch).then(classify)
+}
+```
+
+Without the second bound the builder's pipeline still runs and awaits; only
+`spawn` refuses it.
+
+For a non-`Send` stage, use Tokio's
+[`LocalSet::spawn_local`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html#method.spawn_local)
+with the same ownership pattern:
+
+```rust,ignore
+use skid_pipe::{AsyncPipe, TokioAsyncChainExt};
+
+let result = local.run_until(async {
+    AsyncPipe::new(local_stage)
+        .then(classify)
+        .spawn_local(12)
+        .await
+}).await;
+```
+
+One stateful pipeline processes runs sequentially. To handle jobs concurrently,
+move a distinct pipeline value into each task, or keep one pipeline in a
+long-lived task and send jobs to that task. Aborting a task drops its active
+run future; already-polled `FnMut` state changes are not rolled back.
+
+`TryAsyncPipe` provides the same static composition for futures that resolve
+to `Result<T, E>`. It stops before calling any stage after the first error:
+
+```rust
+use skid_pipe::TryAsyncPipe;
+
+async fn fetch(value: u8) -> Result<u16, &'static str> {
+    Ok(u16::from(value))
+}
+
+async fn validate(value: u16) -> Result<bool, &'static str> {
+    if value == 0 { Err("empty") } else { Ok(value > 10) }
+}
+
+# async fn example() {
+let mut pipeline = TryAsyncPipe::new(fetch).try_then(validate);
+assert_eq!(pipeline.run(12).await, Ok(true));
+# }
+```
+
+Its returned future likewise keeps a mutable borrow until completion or drop.
+Dropping a pending run permits a later run, but state changes already made by
+polled `FnMut` stages are retained.
+
 ## Long async chains and embedded stacks
 
 All four pipeline variants are compiled and executed with 100 stages on the
 declared Rust 1.86 MSRV without requiring callers to raise rustc's default
-recursion limit. Async chains use flat eight-stage internal state machines to
-keep compiler layout recursion bounded, and each machine borrows the
-sub-pipeline it drives as one pointer rather than one per stage.
+recursion limit. Async chains put each group of sixteen stages into one `async`
+block, and rustc overlaps a group's stage futures into a single slot, so the
+run future stops growing once a group is full.
+
+Past 127 stages that no longer holds: the calling crate has to raise
+`#![recursion_limit]` itself. The `wide` feature widens a group to
+thirty-two, which shrinks the run future further — a 100-stage chain goes from
+120 B to 72 B — but does not move that 127-stage ceiling.
 
 This is a supported compilation and behavior boundary, not a promise that a
 100-stage future fits every firmware task stack. Pipeline future size grows

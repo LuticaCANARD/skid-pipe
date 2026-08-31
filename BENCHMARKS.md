@@ -323,9 +323,10 @@ a throughput claim across those categories.
 ## The async-block rewrite (0.3.0)
 
 0.3.0 replaced the hand-written state machines in `src/future.rs` with one
-`async` block per group of eight stages. The composition shape is unchanged —
-arities one to eight terminate on `End`, longer chains fold eight at a time —
-so this measures the machine, not the algorithm. Both columns come from the
+`async` block per group of stages. The composition shape is the one those
+machines used, one group wider — arities one to sixteen terminate on `End`,
+longer chains fold sixteen at a time — so this measures the machine, not the
+algorithm. Both columns come from the
 same machine and session, `benches/composition.rs` and `benches/diagnose.rs`
 run against each tree in turn.
 
@@ -362,8 +363,10 @@ That last row is why `run` returns an `async` block instead of being an
 320 B and 416 B on the same example against the block form's 216 B and 312 B,
 so clippy's `manual_async_fn` is allowed at each `run` rather than taken.
 
-Group width is the second lever, and the larger one. Measured at four, eight
-and sixteen with everything else fixed:
+Group width is the second lever, and the larger one. Measured at four, eight,
+sixteen and thirty-two with everything else fixed. The build column is a clean
+`cargo build` of this crate alone, taken only for the two widths that were
+candidates to ship:
 
 | Width | 100-stage success | 100-stage first error | Run future | `.text`, v7em | Clean build |
 |---:|---:|---:|---:|---:|---:|
@@ -373,18 +376,22 @@ and sixteen with everything else fixed:
 | 32 | 364.11 ns | 18.501 ns | 72 B | 5,803 B | 8.08 s |
 
 Nothing turns over until 32, where the crate's own compile time is what pays
-for the last step: a clean `cargo build` goes from 1.5 s to about 8 s. That is
+for the last step: a clean `cargo build` goes from 1.70 s to about 8 s. That is
 also where the ladder stops. At 64 the macro needs `#![recursion_limit]` raised
 inside this crate and the same build takes 65 s, so the cost roughly eights per
 doubling while the rows it buys are already close to flat. That is the only row with a trade in it, so 32 is the
 `wide` feature and 16 is the default. Every chain of 16 stages or fewer — the
 shape this crate is actually for — is identical either way.
 
-`wide` is additive, which is the only reason it can be a Cargo feature at all.
-It never removes an impl: turning it on extends the ladder from 16 to 32 and
-swaps which group size folds over a longer chain, so a build that worked
-without it still works with it. A pair of mutually exclusive `width-N`
-features would not survive feature unification.
+`wide` is additive, which is the only reason it can be a Cargo feature at all —
+but not because nothing is removed. Turning it on does delete four impls: the
+16-wide `rest` arms are gated `#[cfg(not(feature = "wide"))]`, and they have to
+be, since they cover the same seventeen-layer chains the new arity-17 impls do
+and would overlap them. What stays fixed is the *set of types* implementing the
+trait; only the impl covering a long chain is swapped for a wider one. That is
+the invariant a future width has to preserve: every chain that resolved before
+still resolves, so a build that worked without the feature still works with it.
+A pair of mutually exclusive `width-N` features would not.
 
 The macro is what makes any of this movable. Writing 34 impls per trait out by
 hand is what kept the width at eight.
@@ -420,6 +427,13 @@ Flash, `tests/fixtures/no_std` built at `opt-level = "z"`, `.text` totals:
 
 The fixture's synchronous 100-stage paths are identical in both trees, so the
 async-only saving is larger than these totals show.
+
+The `Send` ladder is a second copy of the composition rather than a delegation
+to the first. `fn run_send(..) -> impl Future<..> + Send { AsyncChain::run(self,
+input) }` is the obvious shrink and does not work: with `AsyncChainSend` taking
+`AsyncChain` as a supertrait, resolving it that way overflows, and raising the
+crate's `recursion_limit` to let it try further segfaults rustc rather than
+finishing. The copies stay.
 
 One limit worth naming: a chain longer than 127 stages now needs
 `#![recursion_limit]` raised in the calling crate, where the hand-written

@@ -72,3 +72,12 @@ jobs:
           --test erasure
           --test try_async_pipeline
           --test hundred_stages
+      # `wide` is the only other ladder shape, and the one whose `rest` arms and
+      # deeper `async` block layout nothing else exercises under a UB checker.
+      - run: >-
+          cargo miri test --features wide
+          --test async_pipeline
+          --test erasure
+          --test try_async_pipeline
+          --test hundred_stages
+          --test fold_boundary

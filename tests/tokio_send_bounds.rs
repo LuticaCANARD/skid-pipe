@@ -14,16 +14,30 @@ use std::rc::Rc;
 
 use skid_pipe::{AsyncPipe, TokioAsyncChainExt, TokioTryAsyncChainExt, TryAsyncPipe};
 
-#[macro_use]
-#[path = "../benches/support/footprint.rs"]
-mod support;
-
 fn increment(value: u16) -> core::future::Ready<u16> {
     core::future::ready(value + 1)
 }
 
 fn try_increment(value: u16) -> core::future::Ready<Result<u16, &'static str>> {
     core::future::ready(Ok(value + 1))
+}
+
+/// Appends ten stages. Local rather than reaching into `benches/support`,
+/// which is bench infrastructure and not maintained for the test suite.
+macro_rules! append_ten {
+    ($pipeline:expr, $method:ident, $stage:path) => {
+        $pipeline
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+            .$method($stage)
+    };
 }
 
 fn runtime() -> tokio::runtime::Runtime {

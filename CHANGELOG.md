@@ -12,8 +12,8 @@ API changes. See the compatibility policy in the README before upgrading.
 
 Async sequencing is now written as `async` blocks instead of hand-written state
 machines, so the crate contains no `unsafe` code at all. The composition shape
-is unchanged: arities one to eight terminate on `End` and longer chains fold
-eight stages at a time, exactly as the removed machines did.
+is the one the removed machines used, one group wider: arities one to sixteen
+terminate on `End` and longer chains fold sixteen stages at a time.
 
 ### Changed (internal)
 
@@ -63,9 +63,9 @@ eight stages at a time, exactly as the removed machines did.
 Measured on one machine against 0.2.1; BENCHMARKS.md carries the tables.
 Shorter chains and embedded footprint improve, deep chains regress.
 
-- Flash for `tests/fixtures/no_std` at `opt-level = "z"` drops 36% on
-  `thumbv7em-none-eabihf` (10,375 B to 6,651 B) and 21% on
-  `thumbv6m-none-eabi`.
+- Flash for `tests/fixtures/no_std` at `opt-level = "z"` drops 42% on
+  `thumbv7em-none-eabihf` (10,375 B to 6,045 B) and 23% on
+  `thumbv6m-none-eabi` (12,327 B to 9,531 B).
 - An eight-stage run future drops from 64 B to 24 B and the 100-stage one from
   240 B to 120 B infallible, 240 B to 216 B fallible: the compiler overlaps a
   group's stage futures into one slot.
@@ -256,9 +256,8 @@ No code migration is required from 0.1.0.
 - Added native, WebAssembly, and embedded target validation with Rust 1.86 as
   the minimum supported Rust version (MSRV).
 
-[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
-[0.3.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
-[0.3.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.1...v0.1.2
