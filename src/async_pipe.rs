@@ -110,485 +110,139 @@ pub trait AsyncChain<Input>: Sized {
     fn run(&mut self, input: Input) -> impl Future<Output = Self::Output>;
 }
 
-impl<S1, Input> AsyncChain<Input> for AsyncPipe<S1, End>
-where
-    S1: AsyncStep<Input>,
-{
-    type Output = <S1 as AsyncStep<Input>>::Output;
+// The impl ladders below are mechanical: one impl per arity up to 16, then one
+// that folds 16 stages over any shorter chain. They are macros because arity is
+// this crate's main performance lever — a group's stages share one `async`
+// block and rustc overlaps their futures into a single slot, so a wider group
+// means a flatter, smaller future. Widening is adding invocation lines.
 
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move { self.head.call(input).await }
-    }
+/// Folds a stage list into the nested pipeline type it names.
+macro_rules! async_chain_ty {
+    ($bottom:ty;) => { $bottom };
+    ($bottom:ty; $s:ident $($rest:ident)*) => { async_chain_ty!(AsyncPipe<$s, $bottom>; $($rest)*) };
 }
 
-impl<S1, S2, Input> AsyncChain<Input> for AsyncPipe<S2, AsyncPipe<S1, End>>
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-{
-    type Output = <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output;
+/// Walks `.tail` once per stage below the one being reached.
+macro_rules! async_chain_at {
+    ($this:expr;) => { $this };
+    ($this:expr; $s:ident $($rest:ident)*) => { async_chain_at!($this.tail; $($rest)*) };
+}
 
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self.tail.head.call(input).await;
-            self.head.call(carried).await
+/// Emits one `AsyncChain` impl per invocation.
+///
+/// One pass accumulates everything the impl needs: `$cur` is the input type the
+/// next stage sees, so the bounds fall out in order; `$fwd` keeps the stages
+/// innermost-first for the type; `$body` collects the run body as statements.
+/// The body is accumulated rather than recursed into so every `let` lands in a
+/// single expansion — one hygiene context, so each stage's future is a
+/// temporary that dies at its own statement and rustc overlaps them into one
+/// slot, and an early `?` returns from one scope rather than 16.
+macro_rules! async_chain_impls {
+    (rest $($s:ident)+) => {
+        async_chain_impls!(@rest
+            [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output]
+            [AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,]
+            []
+            this input carried
+            [let carried = async_chain_at!(this; $($s)*).run(input).await;]
+            $($s)+);
+    };
+    ($($s:ident)+) => {
+        async_chain_impls!(@end [Input] [] [] this input carried
+            [let carried = input;] $($s)+);
+    };
+
+    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
+        async_chain_impls!(@end
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur>,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = async_chain_at!($this; $($rest)+).head.call($car).await;]
+            $($rest)+);
+    };
+    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
+        async_chain_impls!(@end
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur>,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = $this.head.call($car).await;]);
+    };
+    (@end [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
+        impl<$($fwd,)* Input> AsyncChain<Input> for async_chain_ty!(End; $($fwd)*)
+        where
+            $($b)*
+        {
+            type Output = $out;
+
+            #[inline(always)]
+            #[allow(clippy::manual_async_fn)]
+            fn run(&mut self, $inp: Input) -> impl Future<Output = Self::Output> {
+                let $this = self;
+                async move {
+                    $($body)*
+                    $car
+                }
+            }
         }
-    }
-}
+    };
 
-impl<S1, S2, S3, Input> AsyncChain<Input> for AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
-{
-    type Output =
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output;
+    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
+        async_chain_impls!(@rest
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur>,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = async_chain_at!($this; $($rest)+).head.call($car).await;]
+            $($rest)+);
+    };
+    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
+        async_chain_impls!(@rest
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur>,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = $this.head.call($car).await;]);
+    };
+    (@rest [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
+        impl<$($fwd,)* TailHead, TailTail, Input> AsyncChain<Input> for async_chain_ty!(AsyncPipe<TailHead, TailTail>; $($fwd)*)
+        where
+            $($b)*
+        {
+            type Output = $out;
 
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self.tail.tail.head.call(input).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
+            #[inline(always)]
+            #[allow(clippy::manual_async_fn)]
+            fn run(&mut self, $inp: Input) -> impl Future<Output = Self::Output> {
+                let $this = self;
+                async move {
+                    $($body)*
+                    $car
+                }
+            }
         }
-    }
+    };
+
 }
 
-impl<S1, S2, S3, S4, Input> AsyncChain<Input>
-    for AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
-    S4: AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >,
-{
-    type Output = <S4 as AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >>::Output;
-
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, Input> AsyncChain<Input>
-    for AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
-    S4: AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >,
-    S5: AsyncStep<
-        <S4 as AsyncStep<
-            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-        >>::Output,
-    >,
-{
-    type Output = <S5 as AsyncStep<
-        <S4 as AsyncStep<
-            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-        >>::Output,
-    >>::Output;
-
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, Input> AsyncChain<Input>
-    for AsyncPipe<
-        S6,
-        AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>,
-    >
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
-    S4: AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >,
-    S5: AsyncStep<
-        <S4 as AsyncStep<
-            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-        >>::Output,
-    >,
-    S6:
-        AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >,
-{
-    type Output =
-        <S6 as AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output;
-
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self.tail.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, S7, Input> AsyncChain<Input>
-    for AsyncPipe<
-        S7,
-        AsyncPipe<
-            S6,
-            AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>,
-        >,
-    >
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
-    S4: AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >,
-    S5: AsyncStep<
-        <S4 as AsyncStep<
-            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-        >>::Output,
-    >,
-    S6:
-        AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >,
-    S7: AsyncStep<
-        <S6 as AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-{
-    type Output = <S7 as AsyncStep<
-        <S6 as AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >>::Output;
-
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self.tail.tail.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, S7, S8, Input> AsyncChain<Input>
-    for AsyncPipe<
-        S8,
-        AsyncPipe<
-            S7,
-            AsyncPipe<
-                S6,
-                AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>,
-            >,
-        >,
-    >
-where
-    S1: AsyncStep<Input>,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output>,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>,
-    S4: AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >,
-    S5: AsyncStep<
-        <S4 as AsyncStep<
-            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-        >>::Output,
-    >,
-    S6:
-        AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >,
-    S7: AsyncStep<
-        <S6 as AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-    S8: AsyncStep<
-        <S7 as AsyncStep<
-            <S6 as AsyncStep<
-                <S5 as AsyncStep<
-                    <S4 as AsyncStep<
-                        <S3 as AsyncStep<
-                            <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                        >>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-{
-    type Output = <S8 as AsyncStep<
-        <S7 as AsyncStep<
-            <S6 as AsyncStep<
-                <S5 as AsyncStep<
-                    <S4 as AsyncStep<
-                        <S3 as AsyncStep<
-                            <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output,
-                        >>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >>::Output;
-
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .head
-                .call(input)
-                .await;
-            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input> AsyncChain<Input>
-    for AsyncPipe<
-        S8,
-        AsyncPipe<
-            S7,
-            AsyncPipe<
-                S6,
-                AsyncPipe<
-                    S5,
-                    AsyncPipe<
-                        S4,
-                        AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, AsyncPipe<TailHead, TailTail>>>>,
-                    >,
-                >,
-            >,
-        >,
-    >
-where
-    AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,
-    S1: AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>,
-    S2: AsyncStep<
-        <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output,
-    >,
-    S3: AsyncStep<
-        <S2 as AsyncStep<
-            <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output,
-        >>::Output,
-    >,
-    S4:
-        AsyncStep<
-            <S3 as AsyncStep<
-                <S2 as AsyncStep<
-                    <S1 as AsyncStep<
-                        <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >,
-    S5: AsyncStep<
-        <S4 as AsyncStep<
-            <S3 as AsyncStep<
-                <S2 as AsyncStep<
-                    <S1 as AsyncStep<
-                        <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-    S6: AsyncStep<
-        <S5 as AsyncStep<
-            <S4 as AsyncStep<
-                <S3 as AsyncStep<
-                    <S2 as AsyncStep<
-                        <S1 as AsyncStep<
-                            <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
-                        >>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-    S7: AsyncStep<
-        <S6 as AsyncStep<
-            <S5 as AsyncStep<
-                <S4 as AsyncStep<
-                    <S3 as AsyncStep<
-                        <S2 as AsyncStep<
-                            <S1 as AsyncStep<
-                                <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
-                            >>::Output,
-                        >>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-    S8: AsyncStep<
-        <S7 as AsyncStep<
-            <S6 as AsyncStep<
-                <S5 as AsyncStep<
-                    <S4 as AsyncStep<
-                        <S3 as AsyncStep<
-                            <S2 as AsyncStep<
-                                <S1 as AsyncStep<
-                                    <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
-                                >>::Output,
-                            >>::Output,
-                        >>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >,
-{
-    type Output = <S8 as AsyncStep<
-        <S7 as AsyncStep<
-            <S6 as AsyncStep<
-                <S5 as AsyncStep<
-                    <S4 as AsyncStep<
-                        <S3 as AsyncStep<
-                            <S2 as AsyncStep<
-                                <S1 as AsyncStep<
-                                    <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output,
-                                >>::Output,
-                            >>::Output,
-                        >>::Output,
-                    >>::Output,
-                >>::Output,
-            >>::Output,
-        >>::Output,
-    >>::Output;
-
-    #[inline(always)]
-    #[allow(clippy::manual_async_fn)]
-    fn run(&mut self, input: Input) -> impl Future<Output = Self::Output> {
-        async move {
-            let carried = self
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .run(input)
-                .await;
-            let carried = self
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .tail
-                .head
-                .call(carried)
-                .await;
-            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
+async_chain_impls!(S1);
+async_chain_impls!(S1 S2);
+async_chain_impls!(S1 S2 S3);
+async_chain_impls!(S1 S2 S3 S4);
+async_chain_impls!(S1 S2 S3 S4 S5);
+async_chain_impls!(S1 S2 S3 S4 S5 S6);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
+async_chain_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
+async_chain_impls!(rest S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
 /// The `Send` variant of [`AsyncChain`].
 ///
@@ -602,314 +256,114 @@ pub trait AsyncChainSend<Input>: AsyncChain<Input> {
     fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send;
 }
 
-impl<S1, Input> AsyncChainSend<Input> for AsyncPipe<S1, End>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move { self.head.call(input).await }
-    }
+/// Emits one `AsyncChainSend` impl per invocation.
+///
+/// One pass accumulates everything the impl needs: `$cur` is the input type the
+/// next stage sees, so the bounds fall out in order; `$fwd` keeps the stages
+/// innermost-first for the type; `$body` collects the run body as statements.
+/// The body is accumulated rather than recursed into so every `let` lands in a
+/// single expansion — one hygiene context, so each stage's future is a
+/// temporary that dies at its own statement and rustc overlaps them into one
+/// slot, and an early `?` returns from one scope rather than 16.
+macro_rules! async_chain_send_impls {
+    (rest $($s:ident)+) => {
+        async_chain_send_impls!(@rest
+            [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output]
+            [Input: Send, AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,]
+            []
+            this input carried
+            [let carried = async_chain_at!(this; $($s)*).run_send(input).await;]
+            $($s)+);
+    };
+    ($($s:ident)+) => {
+        async_chain_send_impls!(@end [Input] [Input: Send,] [] this input carried
+            [let carried = input;] $($s)+);
+    };
+
+    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
+        async_chain_send_impls!(@end
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = async_chain_at!($this; $($rest)+).head.call($car).await;]
+            $($rest)+);
+    };
+    (@end [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
+        async_chain_send_impls!(@end
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = $this.head.call($car).await;]);
+    };
+    (@end [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
+        impl<$($fwd,)* Input> AsyncChainSend<Input> for async_chain_ty!(End; $($fwd)*)
+        where
+            $($b)*
+        {
+            #[inline(always)]
+            #[allow(clippy::manual_async_fn)]
+            fn run_send(&mut self, $inp: Input) -> impl Future<Output = Self::Output> + Send {
+                let $this = self;
+                async move {
+                    $($body)*
+                    $car
+                }
+            }
+        }
+    };
+
+    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
+        async_chain_send_impls!(@rest
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = async_chain_at!($this; $($rest)+).head.call($car).await;]
+            $($rest)+);
+    };
+    (@rest [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
+        async_chain_send_impls!(@rest
+            [<$s as AsyncStep<$cur>>::Output]
+            [$($b)* $s: AsyncStep<$cur> + Send, for<'a> <$s as AsyncStep<$cur>>::Future<'a>: Send, <$s as AsyncStep<$cur>>::Output: Send,]
+            [$($fwd)* $s]
+            $this $inp $car
+            [$($body)* let $car = $this.head.call($car).await;]);
+    };
+    (@rest [$out:ty] [$($b:tt)*] [$($fwd:ident)*] $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
+        impl<$($fwd,)* TailHead, TailTail, Input> AsyncChainSend<Input> for async_chain_ty!(AsyncPipe<TailHead, TailTail>; $($fwd)*)
+        where
+            $($b)*
+        {
+            #[inline(always)]
+            #[allow(clippy::manual_async_fn)]
+            fn run_send(&mut self, $inp: Input) -> impl Future<Output = Self::Output> + Send {
+                let $this = self;
+                async move {
+                    $($body)*
+                    $car
+                }
+            }
+        }
+    };
+
 }
 
-impl<S1, S2, Input> AsyncChainSend<Input> for AsyncPipe<S2, AsyncPipe<S1, End>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.head.call(input).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, Input> AsyncChainSend<Input> for AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>:
-        Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.head.call(input).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, Input> AsyncChainSend<Input>
-    for AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>:
-        Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
-    S4: AsyncStep<
-            <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-        > + Send,
-    for<'a> <S4 as AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >>::Future<'a>: Send,
-    <S4 as AsyncStep<
-        <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output,
-    >>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, Input> AsyncChainSend<Input> for AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
-    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
-    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, Input> AsyncChainSend<Input> for AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
-    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
-    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, S7, Input> AsyncChainSend<Input> for AsyncPipe<S7, AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
-    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
-    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S7: AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, S7, S8, Input> AsyncChainSend<Input> for AsyncPipe<S8, AsyncPipe<S7, AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, End>>>>>>>>
-where
-    S1: AsyncStep<Input> + Send,
-    for<'a> <S1 as AsyncStep<Input>>::Future<'a>: Send,
-    <S1 as AsyncStep<Input>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<Input>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Future<'a>: Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output: Send,
-    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output: Send,
-    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S7: AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S8: AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(input).await;
-            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
-
-impl<S1, S2, S3, S4, S5, S6, S7, S8, TailHead, TailTail, Input> AsyncChainSend<Input> for AsyncPipe<S8, AsyncPipe<S7, AsyncPipe<S6, AsyncPipe<S5, AsyncPipe<S4, AsyncPipe<S3, AsyncPipe<S2, AsyncPipe<S1, AsyncPipe<TailHead, TailTail>>>>>>>>>
-where
-    AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send,
-    <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,
-    S1: AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output> + Send,
-    for<'a> <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Future<'a>: Send,
-    <S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output: Send,
-    S2: AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output> + Send,
-    for<'a> <S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Future<'a>: Send,
-    <S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output: Send,
-    S3: AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output: Send,
-    S4: AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S5: AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S6: AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S7: AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    S8: AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output> + Send,
-    for<'a> <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Future<'a>: Send,
-    <S8 as AsyncStep<<S7 as AsyncStep<<S6 as AsyncStep<<S5 as AsyncStep<<S4 as AsyncStep<<S3 as AsyncStep<<S2 as AsyncStep<<S1 as AsyncStep<<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output>>::Output: Send,
-    Input: Send,
-{
-    // `async fn` cannot promise `+ Send` in its return type, which is the
-    // entire reason this trait exists beside the plain one.
-    #[allow(clippy::manual_async_fn)]
-    #[inline(always)]
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send {
-        async move {
-            let carried = self.tail.tail.tail.tail.tail.tail.tail.tail.run_send(input).await;
-            let carried = self.tail.tail.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.tail.head.call(carried).await;
-            let carried = self.tail.tail.head.call(carried).await;
-            let carried = self.tail.head.call(carried).await;
-            self.head.call(carried).await
-        }
-    }
-}
+async_chain_send_impls!(S1);
+async_chain_send_impls!(S1 S2);
+async_chain_send_impls!(S1 S2 S3);
+async_chain_send_impls!(S1 S2 S3 S4);
+async_chain_send_impls!(S1 S2 S3 S4 S5);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
+async_chain_send_impls!(S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
+async_chain_send_impls!(rest S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
