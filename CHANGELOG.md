@@ -8,7 +8,7 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ## [Unreleased]
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-08-31
 
 Async sequencing is now written as `async` blocks instead of hand-written state
 machines, so the crate contains no `unsafe` code at all. The composition shape
