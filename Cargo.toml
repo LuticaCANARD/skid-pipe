@@ -23,7 +23,8 @@ default = []
 # 364.11 ns rather than 385 and its future 72 B rather than 120 B. The crate's
 # own compile time is roughly five times higher. Only chains longer than 16
 # stages see any difference. Enabling it anywhere enables it everywhere, so it
-# stays additive under feature unification.
+# stays additive under feature unification. The ladder stops here: at 64 the
+# macro needs a raised `recursion_limit` and the crate takes 65 s to build.
 wide = []
 tokio = ["dep:tokio"]
 

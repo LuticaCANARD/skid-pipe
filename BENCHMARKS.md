@@ -373,7 +373,10 @@ and sixteen with everything else fixed:
 | 32 | 364.11 ns | 18.501 ns | 72 B | 5,803 B | 8.08 s |
 
 Nothing turns over until 32, where the crate's own compile time is what pays
-for the last step. That is the only row with a trade in it, so 32 is the
+for the last step: a clean `cargo build` goes from 1.5 s to about 8 s. That is
+also where the ladder stops. At 64 the macro needs `#![recursion_limit]` raised
+inside this crate and the same build takes 65 s, so the cost roughly eights per
+doubling while the rows it buys are already close to flat. That is the only row with a trade in it, so 32 is the
 `wide` feature and 16 is the default. Every chain of 16 stages or fewer — the
 shape this crate is actually for — is identical either way.
 
