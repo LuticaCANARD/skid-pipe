@@ -306,11 +306,12 @@ assert!(pipeline.run(12).await);
 ```
 
 The caller may use Tokio, Embassy, a browser/Wasm integration, or any other
-environment. Creating a run future is lazy and free: it is an `async` block, so
-no stage runs and nothing is written until the future is first polled, whatever
-the chain's length. `run` holds the mutable pipeline borrow until its future
-completes or is dropped, so a stateful pipeline instance cannot run
-concurrently. The default core crate does not depend on any executor.
+environment. Creating a run future is lazy and has constant work with respect
+to the chain length: it captures the pipeline borrow and input, but no stage
+runs and no per-group state is built until the future is first polled. `run`
+holds the mutable pipeline borrow until its future completes or is dropped, so
+a stateful pipeline instance cannot run concurrently. The default core crate
+does not depend on any executor.
 
 ### Tokio feature
 

@@ -27,10 +27,11 @@ terminate on `End` and longer chains fold sixteen stages at a time.
   `ThenFuture`, `ThenPairFuture`, `ThenQuadFuture`, `ThenOctFuture`, their
   fallible twins, `AsyncStart`, `TryStart` and `StartStep`). All were
   `#[doc(hidden)]`.
-- Removed the `lazy-construction` feature. Construction is now free
-  unconditionally — an `async` block runs nothing until its first poll — so
-  creating a 100-stage run future costs 0.877 ns rather than 7.02 ns, without
-  the first-error regression the feature traded for.
+- Removed the `lazy-construction` feature. Constructing a run future now has
+  constant work with respect to chain length: an `async` block captures the
+  pipeline borrow and input but runs no stage until its first poll. Creating a
+  100-stage run future costs 0.877 ns rather than 7.02 ns, without the
+  first-error regression the feature traded for.
 
 ### Changed
 
