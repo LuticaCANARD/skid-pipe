@@ -23,7 +23,7 @@ eight stages at a time, exactly as the removed machines did.
   `#[doc(hidden)]`.
 - Removed the `lazy-construction` feature. Construction is now free
   unconditionally — an `async` block runs nothing until its first poll — so
-  creating a 100-stage run future costs 0.885 ns rather than 7.02 ns, without
+  creating a 100-stage run future costs 0.877 ns rather than 7.02 ns, without
   the first-error regression the feature traded for.
 
 ### Changed
@@ -56,10 +56,11 @@ Shorter chains and embedded footprint improve, deep chains regress.
   `thumbv6m-none-eabi`.
 - An eight-stage run future drops from 64 B to 24 B: the compiler overlaps a
   group's stage futures into one slot.
-- The three-stage `TryAsyncPipe` success row drops from 20.820 ns to 11.270 ns;
-  the three-stage `AsyncPipe` one rises from 5.2975 ns to 9.0845 ns.
-- The 100-stage rows regress 18% to 25%, and the 100-stage first-error
-  short-circuit from 23.744 ns to 32.089 ns.
+- The three-stage `TryAsyncPipe` success row drops from 20.820 ns to 11.303 ns;
+  the three-stage `AsyncPipe` one rises from 5.2975 ns to 10.133 ns.
+- The 100-stage rows regress 10% to 17%, and the 100-stage first-error
+  short-circuit from 23.744 ns to 30.913 ns. The 100-stage run future is
+  216 B against 240 B infallible, 312 B against 240 B fallible.
 - A chain longer than 127 stages now needs `#![recursion_limit]` raised in the
   calling crate. The crate's own 100-stage tests compile without it.
 

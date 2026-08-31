@@ -331,13 +331,13 @@ run against each tree in turn.
 
 | | 0.2.1 hand-written | 0.3.0 `async` block |
 |---|---:|---:|
-| `async_three_stage_ready/async_pipe` | 5.2975 ns | 9.0845 ns |
-| `try_async_three_stage_ready_success/try_async_pipe` | 20.820 ns | 11.270 ns |
-| `hundred_stage/async_ready_success/async_pipe` | 361.82 ns | 454.29 ns |
-| `hundred_stage/try_async_ready_success/try_async_pipe` | 397.61 ns | 452.95 ns |
-| `hundred_stage/try_async_error/first/try_async_pipe` | 23.744 ns | 32.089 ns |
-| Create a 3-stage run future | 1.3221 ns | 0.8789 ns |
-| Create a 100-stage run future | 7.0211 ns | 0.8850 ns |
+| `async_three_stage_ready/async_pipe` | 5.2975 ns | 10.133 ns |
+| `try_async_three_stage_ready_success/try_async_pipe` | 20.820 ns | 11.303 ns |
+| `hundred_stage/async_ready_success/async_pipe` | 361.82 ns | 422.26 ns |
+| `hundred_stage/try_async_ready_success/try_async_pipe` | 397.61 ns | 435.27 ns |
+| `hundred_stage/try_async_error/first/try_async_pipe` | 23.744 ns | 30.913 ns |
+| Create a 3-stage run future | 1.3221 ns | 0.9023 ns |
+| Create a 100-stage run future | 7.0211 ns | 0.8768 ns |
 
 Construction no longer scales with chain length: an `async` block does nothing
 until its first poll, so the `O(stages / 8)` stores the old machines wrote at
@@ -356,6 +356,18 @@ Run-future size, from `examples/measure_footprint.rs` and a host-side
 The compiler overlaps the stage futures of a group into one slot, so a group's
 future stops growing with its arity. The rows up to eight are 64-bit host
 measurements; the 100-stage row is the `no_std` footprint example.
+
+That last row is why `run` returns an `async` block instead of being an
+`async fn`. The two spell the same thing, but the `async fn` form measures
+320 B and 416 B on the same example against the block form's 216 B and 312 B,
+so clippy's `manual_async_fn` is allowed at each `run` rather than taken.
+
+Group width is a second lever on the same rows. At width four the 100-stage
+success costs 517.25 ns and the future is 608 B; at width sixteen, 386.30 ns
+and 176 B, with `.text` on `thumbv7em-none-eabihf` falling from 6,651 B to
+6,101 B. Wider was better on every row measured, so there is no trade to
+expose as a knob — only a width to pick, and eight is a conservative one that
+keeps the generated impl count at nine per trait.
 
 Flash, `tests/fixtures/no_std` built at `opt-level = "z"`, `.text` totals:
 
