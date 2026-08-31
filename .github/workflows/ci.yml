@@ -41,6 +41,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
       - run: cargo test --features tokio
+      - run: cargo test --features wide
       - run: cargo build
       - name: Check public API documentation
         env:
@@ -54,6 +55,7 @@ jobs:
       - run: cargo check --target riscv32imac-unknown-none-elf
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+      - run: cargo check --target thumbv6m-none-eabi --features wide
 
   miri:
     runs-on: ubuntu-latest

@@ -504,6 +504,7 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --features tokio
+cargo test --features wide
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo +1.86 bench --bench composition -- --warm-up-time 1 --measurement-time 2 --sample-size 50
 cargo check --target wasm32-unknown-unknown
@@ -513,5 +514,6 @@ cargo check --target thumbv7em-none-eabihf
 cargo check --target riscv32imac-unknown-none-elf
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
+cargo check --target thumbv6m-none-eabi --features wide
 cargo +nightly-2026-04-03 miri test --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
 ```
