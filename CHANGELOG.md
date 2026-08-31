@@ -69,8 +69,11 @@ Shorter chains and embedded footprint improve, deep chains regress.
 - An eight-stage run future drops from 64 B to 24 B and the 100-stage one from
   240 B to 120 B infallible, 240 B to 216 B fallible: the compiler overlaps a
   group's stage futures into one slot.
-- The three-stage `TryAsyncPipe` success row drops from 20.820 ns to 11.447 ns;
-  the three-stage `AsyncPipe` one rises from 5.2975 ns to 9.2050 ns.
+- The three-stage rows move in both directions — `TryAsyncPipe` 20.820 ns to
+  11.447 ns, `AsyncPipe` 5.2975 ns to 9.2050 ns — but neither is a property of
+  this change: disassembling the shape they benchmark gives identical code for
+  the infallible pair and 52 instructions against 46 for the fallible one. See
+  BENCHMARKS.md.
 - The 100-stage first-error short-circuit improves from 23.744 ns to 21.755 ns.
   The 100-stage success rows regress: fallible 397.61 ns to 408.38 ns,
   infallible 361.82 ns to between 385 ns and 419 ns across runs.

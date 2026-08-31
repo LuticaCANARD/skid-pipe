@@ -389,6 +389,20 @@ features would not survive feature unification.
 The macro is what makes any of this movable. Writing 34 impls per trait out by
 hand is what kept the width at eight.
 
+The two three-stage rows above should not be read as a property of this
+change. Compiling the exact shape each one benchmarks — the same three
+`#[inline(never)]` stages, the pipeline held outside the timed closure — and
+disassembling it gives, for the infallible group, 21 instructions and three
+indirect calls on both trees, differing only in whether the first poll's tag
+check is spelled `testb $0x1, %al` or `cmpl $0x1, %eax`. Identical work, a
+74% slower row. The fallible group does shrink, 52 instructions to 46, which
+matches the direction of its 45% faster row but not its size.
+
+At five to twenty nanoseconds around three non-inlinable calls, those rows
+measure how the benchmark binary inlines and places the `run` call, not what
+the composed pipeline compiles to. The rows that do carry signal are the
+100-stage ones, the footprints and the `.text` totals.
+
 How the body is written matters as much as how wide it is. The stages must be
 separate `let` statements in one scope. Nesting them as a single expression
 keeps every stage's future alive to the end of the statement and the run future
