@@ -12,7 +12,7 @@ Its default core uses only `core`:
 - zero allocation
 - static dispatch
 - no runtime or executor
-- safe public API; `unsafe` is isolated to async future pin projection
+- no `unsafe` anywhere in the crate (`#![forbid(unsafe_code)]`)
 - native, WebAssembly, and embedded-core compatible
 
 It is not an immediate-value pipe operator, a `Result`-only framework, or a
@@ -124,8 +124,8 @@ cargo +1.86 bench --bench composition -- \
 ```
 
 Criterion is a benchmark-only development dependency; the published library's
-default normal dependency graph remains empty. The opt-in `tokio` feature is
-not included in these measurements.
+default normal dependency graph remains empty. Neither the opt-in `tokio`
+feature nor `wide` is included in these measurements.
 
 Treat the resulting nanoseconds as machine-local evidence, not a portable
 performance promise. Flash size, stack use, and assembly require target-specific
@@ -306,38 +306,11 @@ assert!(pipeline.run(12).await);
 ```
 
 The caller may use Tokio, Embassy, a browser/Wasm integration, or any other
-environment. Creating a run future is lazy: the first stage is not called until
-the future is polled. Construction is not free, though: the run future writes
-one pointer and one state tag per group of eight stages, so an unpolled run — or
-one that short-circuits on the first stage's error — still costs `O(stages / 8)`
-stores. `run` holds the mutable pipeline borrow until its future completes or is
-dropped, so a stateful pipeline instance cannot run concurrently. The default
-core crate does not depend on any executor.
-
-### Lazy construction feature
-
-`skid-pipe` builds a run future's whole nest of link futures when `run` is
-called. That is the faster arrangement end to end, and it is the default. A
-workload that creates run futures it may drop before ever polling them — a
-select arm that loses, a task cancelled at its first await point — pays that
-construction for nothing. For those, enable:
-
-```toml
-[dependencies]
-skid-pipe = { version = "0.2", features = ["lazy-construction"] }
-```
-
-Each link future then parks its input and builds its tail on the first poll,
-so creating one is a single layer's work no matter how long the chain is. The
-public API, the run future's size, and the guarantee that no stage runs before
-the first poll are all unchanged; only where the nest is built moves.
-
-It is a trade, not a free win. On the snapshot machine, creating a 100-stage
-run future drops from 9.8489 ns to 1.2309 ns, while the 100-stage first-error
-run regresses 19.6% and the three-stage success rows 9.2% (`AsyncPipe`) and
-1.6% (`TryAsyncPipe`). Measure your own workload before enabling it; if your
-run futures are always polled to completion, leave it off. See
-[BENCHMARKS.md](BENCHMARKS.md) for the full numbers.
+environment. Creating a run future is lazy and free: it is an `async` block, so
+no stage runs and nothing is written until the future is first polled, whatever
+the chain's length. `run` holds the mutable pipeline borrow until its future
+completes or is dropped, so a stateful pipeline instance cannot run
+concurrently. The default core crate does not depend on any executor.
 
 ### Tokio feature
 
@@ -345,7 +318,7 @@ Enable the optional integration when the application already uses Tokio:
 
 ```toml
 [dependencies]
-skid-pipe = { version = "0.2", features = ["tokio"] }
+skid-pipe = { version = "0.3", features = ["tokio"] }
 ```
 
 The feature enables Tokio's minimal `rt` feature and exports two extension
@@ -365,10 +338,27 @@ let task = AsyncPipe::new(fetch)
     .spawn(12);
 ```
 
-`spawn` requires the pipeline, input, output, and concrete run future to meet
+`spawn` requires the pipeline, input, output, and composed run future to meet
 Tokio's `Send + 'static` boundary. A run future created from a pipeline that
 stays on the caller's stack borrows that pipeline and therefore cannot itself
 be made `'static`.
+
+The composed future is an unnameable `impl Future`, so that `Send` bound cannot
+be written directly. `AsyncChainSend` and `TryAsyncChainSend` restate the same
+composition with `Send` promised in the return type, and `spawn` asks for them.
+Concrete pipelines get them automatically, but a builder that hides its type
+must say so:
+
+```rust,ignore
+use skid_pipe::{AsyncChain, AsyncChainSend, AsyncPipe};
+
+fn build() -> impl AsyncChain<u8, Output = bool> + AsyncChainSend<u8> {
+    AsyncPipe::new(fetch).then(classify)
+}
+```
+
+Without the second bound the builder's pipeline still runs and awaits; only
+`spawn` refuses it.
 
 For a non-`Send` stage, use Tokio's
 [`LocalSet::spawn_local`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html#method.spawn_local)
@@ -418,9 +408,14 @@ polled `FnMut` stages are retained.
 
 All four pipeline variants are compiled and executed with 100 stages on the
 declared Rust 1.86 MSRV without requiring callers to raise rustc's default
-recursion limit. Async chains use flat eight-stage internal state machines to
-keep compiler layout recursion bounded, and each machine borrows the
-sub-pipeline it drives as one pointer rather than one per stage.
+recursion limit. Async chains put each group of sixteen stages into one `async`
+block, and rustc overlaps a group's stage futures into a single slot, so the
+run future stops growing once a group is full.
+
+Past 127 stages that no longer holds: the calling crate has to raise
+`#![recursion_limit]` itself. The `wide` feature widens a group to
+thirty-two, which shrinks the run future further — a 100-stage chain goes from
+120 B to 72 B — but does not move that 127-stage ceiling.
 
 This is a supported compilation and behavior boundary, not a promise that a
 100-stage future fits every firmware task stack. Pipeline future size grows
@@ -440,13 +435,11 @@ boundaries over one 100-stage future. This lets each phase's run future finish
 before the next is created and gives the linker and stack analysis smaller,
 more useful units to inspect.
 
-The synchronous paths contain no unsafe code. Async sequencing keeps only one
-active stage future in an internal union and uses isolated pin projection in
-`src/future.rs`; the crate denies unsafe code outside that module, and CI fails
-if any other file opts back in. The active union variant is tracked explicitly,
-dropped in place exactly once, and tested under Miri across pending,
-cancellation, short-circuit, and 100-stage paths.
-Callers never need unsafe code.
+The crate contains no unsafe code at all, and `#![forbid(unsafe_code)]` keeps
+it that way. Async sequencing is an ordinary `async` block per group of stages,
+so rustc generates each state machine, its discriminant, its drop glue and its
+pin projection, and only one stage future in a group is live at a time because
+the compiler overlaps them. Callers never need unsafe code either.
 
 ## API boundaries
 
@@ -608,7 +601,7 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --features tokio
-cargo test --features lazy-construction
+cargo test --features wide
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo +1.86 bench --bench composition -- --warm-up-time 1 --measurement-time 2 --sample-size 50
 cargo check --target wasm32-unknown-unknown
@@ -618,7 +611,6 @@ cargo check --target thumbv7em-none-eabihf
 cargo check --target riscv32imac-unknown-none-elf
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
-cargo check --target thumbv6m-none-eabi --features lazy-construction
+cargo check --target thumbv6m-none-eabi --features wide
 cargo +nightly-2026-04-03 miri test --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
-cargo +nightly-2026-04-03 miri test --features lazy-construction --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
 ```

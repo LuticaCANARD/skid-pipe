@@ -160,8 +160,9 @@ firmware image.
 
 Three changes aimed at the two `TryAsyncPipe` rows above were implemented and
 measured against this snapshot's machine. Two are recorded here so the same
-ground is not retried from the same reasoning; the third became the optional
-`lazy-construction` feature described after them.
+ground is not retried from the same reasoning; the third became the
+`lazy-construction` feature, which 0.3.0 removed because the async-block
+rewrite makes construction free unconditionally (see the last section).
 
 The `benches/diagnose.rs` groups split those rows into the costs behind them:
 creating a run future without polling it, an infallible and a fallible pipeline
@@ -203,57 +204,6 @@ forwarding the stores.
 Two of the three were predicted to help from reading the code and did not.
 Treat the per-layer costs above as measured, and anything about why they are
 what they are as a hypothesis until a benchmark says otherwise.
-
-The third is not rejected but optional; it is described below.
-
-## The `lazy-construction` feature
-
-Each machine's `new` builds its tail chain's future immediately, so creating a
-100-stage run future costs 9.8489 ns before any stage runs. The
-`lazy-construction` feature parks the input in the slot union instead, behind
-an `Input` state the feature adds, and builds the tail on the first poll.
-
-| | Default | `lazy-construction` | Change |
-|---|---:|---:|---:|
-| Create a 100-stage `TryAsyncPipe` run future | 9.8489 ns | 1.2309 ns | −87.5% |
-| Create a 100-stage `AsyncPipe` one | 9.8516 ns | 1.2182 ns | −87.6% |
-| Create a 3-stage one | 1.8354 ns | 1.2286 ns | −33.1% |
-| 100-stage first error | 34.084 ns | 40.758 ns | +19.6% |
-| 10-stage first error | 20.005 ns | 25.187 ns | +25.9% |
-| 3-stage first error | 20.005 ns | 21.092 ns | +5.4% |
-| 3-stage success, `AsyncPipe` | 23.737 ns | 25.925 ns | +9.2% |
-| 3-stage success, `TryAsyncPipe` | 44.563 ns | 45.269 ns | +1.6% |
-
-Both columns come from the same commit and the same session, with only the
-feature flag differing. Every row's confidence intervals are disjoint between
-the columns, while those of the `first_error_depth/direct` control, which
-contains no pipeline code, sit on top of each other ([12.896, 13.049] ns
-against [12.925, 13.034] ns). The deltas are the feature.
-
-Their magnitudes are less stable than those intervals suggest. An earlier
-run of the same pair put the 10-stage first error at +15.4% rather than
-+25.9%, and the 3-stage one at +9.4% rather than +5.4%. Between-run drift on
-this machine exceeds within-run precision on the shorter rows, so read the
-direction and the order of magnitude, not the second digit. The creation rows
-and the 100-stage first error reproduced across both runs to within a few
-tenths of a percent.
-
-Creating a run future becomes one layer's work regardless of chain length, and
-one dropped before its first poll becomes O(1). The work is not removed, only
-moved: it lands in `poll`, where one extra state per layer costs more than it
-saved. So the feature is off by default — the default build optimizes
-end-to-end latency — and is worth enabling only for a workload that creates run
-futures it may never poll.
-
-The run future's layout is identical either way. The slot union already had to
-be at least as wide as `Input`, because the tail future bottoms out in a
-`FirstStageFuture` that holds it, so the added member costs no bytes: the
-100-stage async and try-async futures measure 240 B on x86_64 under both
-configurations. The public API and the guarantee that no stage runs before the
-first poll are unchanged.
-
-The change that did exactly what it was designed to do still lost on latency.
-That is why it is a feature rather than a default.
 
 ## Against the `futures` combinators
 
@@ -369,3 +319,126 @@ Mixing any of these into the tables above would make their task/channel,
 allocation, context lookup, or dispatch strategy look like a defect rather
 than the feature the caller chose. Add a workload-specific suite before making
 a throughput claim across those categories.
+
+## The async-block rewrite (0.3.0)
+
+0.3.0 replaced the hand-written state machines in `src/future.rs` with one
+`async` block per group of stages. The composition shape is the one those
+machines used, one group wider — arities one to sixteen terminate on `End`,
+longer chains fold sixteen at a time — so this measures the machine, not the
+algorithm. Both columns come from the
+same machine and session, `benches/composition.rs` and `benches/diagnose.rs`
+run against each tree in turn.
+
+| | 0.2.1 hand-written | 0.3.0 `async` block |
+|---|---:|---:|
+| `async_three_stage_ready/async_pipe` | 5.2975 ns | 9.2050 ns |
+| `try_async_three_stage_ready_success/try_async_pipe` | 20.820 ns | 11.447 ns |
+| `hundred_stage/async_ready_success/async_pipe` | 361.82 ns | 385 – 419 ns |
+| `hundred_stage/try_async_ready_success/try_async_pipe` | 397.61 ns | 408.38 ns |
+| `hundred_stage/try_async_error/first/try_async_pipe` | 23.744 ns | 21.755 ns |
+| Create a 3-stage run future | 1.3221 ns | 0.9023 ns |
+| Create a 100-stage run future | 7.0211 ns | 0.8768 ns |
+
+Construction no longer scales with chain length: an `async` block does nothing
+until its first poll, so the `O(stages / 8)` stores the old machines wrote at
+`run` are gone and the `lazy-construction` feature has nothing left to buy.
+
+Run-future size, from `examples/measure_footprint.rs` and a host-side
+`size_of_val` probe over the shorter chains an embedded target actually builds:
+
+| Stages | 0.2.1 `AsyncPipe` | 0.3.0 | 0.2.1 `TryAsyncPipe` | 0.3.0 |
+|---:|---:|---:|---:|---:|
+| 2 | 32 B | 24 B | 32 B | 24 B |
+| 4 | 48 B | 24 B | 48 B | 24 B |
+| 8 | 64 B | 24 B | 64 B | 32 B |
+| 100 | 240 B | 120 B | 240 B | 216 B |
+
+The compiler overlaps the stage futures of a group into one slot, so a group's
+future stops growing with its arity. The rows up to eight are 64-bit host
+measurements; the 100-stage row is the `no_std` footprint example.
+
+That last row is why `run` returns an `async` block instead of being an
+`async fn`. The two spell the same thing, but the `async fn` form measures
+320 B and 416 B on the same example against the block form's 216 B and 312 B,
+so clippy's `manual_async_fn` is allowed at each `run` rather than taken.
+
+Group width is the second lever, and the larger one. Measured at four, eight,
+sixteen and thirty-two with everything else fixed. The build column is a clean
+`cargo build` of this crate alone, taken only for the two widths that were
+candidates to ship:
+
+| Width | 100-stage success | 100-stage first error | Run future | `.text`, v7em | Clean build |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 517.25 ns | 54.603 ns | 608 B | 6,651 B | |
+| 8 | 466.66 ns | 35.200 ns | 320 B | 6,721 B | |
+| 16 | 385 – 419 ns | 21.755 ns | 120 B | 6,045 B | 1.70 s |
+| 32 | 364.11 ns | 18.501 ns | 72 B | 5,803 B | 8.08 s |
+
+Nothing turns over until 32, where the crate's own compile time is what pays
+for the last step: a clean `cargo build` goes from 1.70 s to about 8 s. That is
+also where the ladder stops. At 64 the macro needs `#![recursion_limit]` raised
+inside this crate and the same build takes 65 s, so the cost roughly eights per
+doubling while the rows it buys are already close to flat. That is the only row with a trade in it, so 32 is the
+`wide` feature and 16 is the default. Every chain of 16 stages or fewer — the
+shape this crate is actually for — is identical either way.
+
+`wide` is additive, which is the only reason it can be a Cargo feature at all —
+but not because nothing is removed. Turning it on does delete four impls: the
+16-wide `rest` arms are gated `#[cfg(not(feature = "wide"))]`, and they have to
+be, since they cover the same seventeen-layer chains the new arity-17 impls do
+and would overlap them. What stays fixed is the *set of types* implementing the
+trait; only the impl covering a long chain is swapped for a wider one. That is
+the invariant a future width has to preserve: every chain that resolved before
+still resolves, so a build that worked without the feature still works with it.
+A pair of mutually exclusive `width-N` features would not.
+
+The macro is what makes any of this movable. Writing 34 impls per trait out by
+hand is what kept the width at eight.
+
+The two three-stage rows above should not be read as a property of this
+change. Compiling the exact shape each one benchmarks — the same three
+`#[inline(never)]` stages, the pipeline held outside the timed closure — and
+disassembling it gives, for the infallible group, 21 instructions and three
+indirect calls on both trees, differing only in whether the first poll's tag
+check is spelled `testb $0x1, %al` or `cmpl $0x1, %eax`. Identical work, a
+74% slower row. The fallible group does shrink, 52 instructions to 46, which
+matches the direction of its 45% faster row but not its size.
+
+At five to twenty nanoseconds around three non-inlinable calls, those rows
+measure how the benchmark binary inlines and places the `run` call, not what
+the composed pipeline compiles to. The rows that do carry signal are the
+100-stage ones, the footprints and the `.text` totals.
+
+How the body is written matters as much as how wide it is. The stages must be
+separate `let` statements in one scope. Nesting them as a single expression
+keeps every stage's future alive to the end of the statement and the run future
+grows with the group — 912 B against 120 B at width sixteen. Nesting them as
+recursive blocks instead costs the error path, because an early `?` unwinds one
+scope per stage: 36.663 ns against 21.755 ns on the 100-stage first error. So
+the macro accumulates the body into one expansion and emits it flat.
+
+Flash, `tests/fixtures/no_std` built at `opt-level = "z"`, `.text` totals:
+
+| Target | 0.2.1 | 0.3.0 | 0.3.0 `wide` |
+|---|---:|---:|---:|
+| `thumbv7em-none-eabihf` | 10,375 B | 6,045 B | 5,803 B |
+| `thumbv6m-none-eabi` | 12,327 B | 9,531 B | |
+
+The fixture's synchronous 100-stage paths are identical in both trees, so the
+async-only saving is larger than these totals show.
+
+The `Send` ladder is a second walk over the composition rather than a
+delegation to the first. `fn run_send(..) -> impl Future<..> + Send {
+AsyncChain::run(self, input) }` is the obvious shrink, and it works for the
+arities that terminate on `End` — but not for the arm that folds a group over
+a shorter chain. Proving that return type is `Send` means looking through
+`run`'s opaque future, which for the folding arm contains the tail chain's own
+opaque future, so the compiler searches `Chain` impls for a generic tail with
+inference variables and recurses until it overflows; raising `recursion_limit`
+to let it search further segfaults rustc instead of finishing. Both walks stay,
+but they share one accumulator.
+
+One limit worth naming: a chain longer than 127 stages now needs
+`#![recursion_limit]` raised in the calling crate, where the hand-written
+machines did not. The crate's own 100-stage tests compile without it.

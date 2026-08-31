@@ -1,7 +1,6 @@
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(unsafe_code)]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 //! Portable, typed composition of ordinary Rust functions.
 //!
@@ -10,9 +9,9 @@
 //! so the same pipeline types work on native targets, WebAssembly, and
 //! `no_std` firmware. The opt-in `tokio` feature adds task-spawning adapters
 //! for Tokio applications without changing the default core.
-//! The public API is safe. Internal async futures isolate the pin projection
-//! needed to run long static chains without raising rustc's recursion limit;
-//! unsafe code is denied everywhere else in the crate.
+//! The crate contains no `unsafe` code at all: async sequencing is ordinary
+//! `async` blocks, so the compiler generates every state machine, its drop
+//! glue, and its pin projection.
 //!
 //! # Synchronous pipeline
 //!
@@ -177,25 +176,20 @@
 //! let _ = pipeline.run(1_u8);
 //! ```
 
+#[macro_use]
+mod ladder;
+
 mod async_pipe;
-#[allow(unsafe_code)]
-mod future;
 mod pipe;
 #[cfg(feature = "tokio")]
 mod tokio;
 mod try_async_pipe;
 mod try_pipe;
 
-pub use async_pipe::{AsyncChain, AsyncPipe, AsyncStep};
-#[doc(hidden)]
-pub use future::{
-    AsyncStart, FirstStageFuture, StartStep, ThenFuture, ThenOctFuture, ThenPairFuture,
-    ThenQuadFuture, TryStart, TryThenFuture, TryThenOctFuture, TryThenPairFuture,
-    TryThenQuadFuture,
-};
+pub use async_pipe::{AsyncChain, AsyncChainSend, AsyncPipe, AsyncStep};
 pub use pipe::{Chain, End, Pipe, Step};
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use tokio::{TokioAsyncChainExt, TokioTryAsyncChainExt};
-pub use try_async_pipe::{TryAsyncChain, TryAsyncPipe, TryAsyncStep};
+pub use try_async_pipe::{TryAsyncChain, TryAsyncChainSend, TryAsyncPipe, TryAsyncStep};
 pub use try_pipe::{TryChain, TryPipe, TryStep};
