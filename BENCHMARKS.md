@@ -1,4 +1,210 @@
-# Benchmark snapshot
+# Benchmarks
+
+Latest measurement: 2026-09-12, Rust 1.98.1.
+
+Measured source: `f35d74d3120f636a8ae1fac30999fcc0e8f62d05` (package metadata still says 0.3.0; these are the newer committed sources, not the published 0.3.0 release).
+
+## Result
+
+Across two runs, the ordinary async pipeline took 67–70% less time than the
+futures combinator chain at three stages, and 59–61% less at ten stages.
+The direct async fn and skid-pipe results were close: the ordering at three
+stages reversed between runs, and the ten-stage estimates were within 3%.
+There is no consistent direct-call speed advantage to claim for skid-pipe.
+The first-error ten-stage comparison favors skid-pipe over futures by 5.19–5.99x.
+
+Long chains still have unfavorable cases. In the composition benchmark,
+100-stage TryAsyncPipe rejecting at the first stage took 17.087 ns versus
+4.522 ns directly (3.78x as long), and rejecting in the middle took 663.789 ns
+versus 363.949 ns (+82.4%). These are separate workloads from vs_futures.
+
+## Environment and method
+
+- Apple M1, 8 CPU cores, 16 GiB RAM; macOS 26.4.1 (25E253), AC power.
+- Rust 1.98.1, LLVM 22.1.8, aarch64-apple-darwin; Cargo 1.98.1.
+- Criterion 0.8.2; futures 0.3.34; tower 0.5.3. Tokio 1.53.1 was resolved but its feature was disabled.
+- Default features, optimized Cargo bench profile; neither wide nor tokio enabled.
+- Precompiled the three benchmarks before timing, then ran vs_futures, composition, and vs_tower sequentially. Repeated vs_futures afterward with identical settings. The footprint example ran after the timed measurements.
+- Warm-up 1 second, measurement 3 seconds per case, 100 samples. Main run: 58 cases; repeat: 15 cases. Each command exited successfully.
+- Values use Criterion's slope point estimate where available, otherwise its mean. All 73 estimates include 95% confidence intervals in the appendix below.
+- These are existing Ready-future microbenchmarks with black_box barriers and non-inlined stage functions. Pipeline construction is outside the timed loop; futures combinators are rebuilt inside it. They do not measure I/O, executor scheduling, end-to-end application throughput, or run_send/spawn latency.
+- The host was not isolated and CPU affinity was not pinned. Some cases have outliers and wide intervals. Cross-run ranges below are ranges of point estimates, not confidence intervals; small differences are not a stable performance promise.
+- The older Intel/WSL2 + Rust 1.86 snapshot uses different hardware, OS, compiler, and sources. Do not attribute differences from it solely to the Rust upgrade or the recent fixes.
+
+## futures comparison: both runs
+
+| Case | Direct async fn | skid-pipe | futures | futures / skid-pipe |
+|---|---:|---:|---:|---:|
+| Async, 3 stages | 7.81–8.33 ns | 8.21–8.90 ns | 26.87–27.00 ns | 3.02–3.29x |
+| Try async, 3 stages | 14.50–15.05 ns | 13.66–14.15 ns | 27.85–29.09 ns | 2.04–2.06x |
+| Try async, 3 stages, first error | 4.30–4.60 ns | 4.18–4.53 ns | 8.52–9.38 ns | 2.04–2.07x |
+| Async, 10 stages | 38.43–38.50 ns | 38.39–39.59 ns | 95.96–98.40 ns | 2.42–2.56x |
+| Try async, 10 stages, first error | 4.51–4.70 ns | 4.55–4.56 ns | 23.65–27.28 ns | 5.19–5.99x |
+
+## Direct composition: first run
+
+| Case | Direct | Pipeline | Pipeline / direct − 1 |
+|---|---:|---:|---:|
+| `async_three_stage_ready` | 4.985 ns | 4.724 ns | -5.2% |
+| `fallible_error/first` | 3.459 ns | 2.375 ns | -31.4% |
+| `fallible_error/last` | 9.260 ns | 10.902 ns | +17.7% |
+| `fallible_error/middle` | 11.092 ns | 10.727 ns | -3.3% |
+| `fallible_success/1_stage` | 1.544 ns | 1.610 ns | +4.3% |
+| `fallible_success/3_stage` | 3.543 ns | 3.991 ns | +12.6% |
+| `fallible_success/8_stage` | 9.452 ns | 11.091 ns | +17.3% |
+| `fallible_type_changing_success` | 4.404 ns | 4.482 ns | +1.8% |
+| `hundred_stage/async_ready_success` | 782.396 ns | 765.782 ns | -2.1% |
+| `hundred_stage/fallible_error/first` | 6.194 ns | 9.298 ns | +50.1% |
+| `hundred_stage/fallible_error/last` | 780.661 ns | 753.457 ns | -3.5% |
+| `hundred_stage/fallible_error/middle` | 548.861 ns | 468.834 ns | -14.6% |
+| `hundred_stage/fallible_success` | 741.556 ns | 765.688 ns | +3.3% |
+| `hundred_stage/sync_success` | 602.950 ns | 566.867 ns | -6.0% |
+| `hundred_stage/try_async_error/first` | 4.522 ns | 17.087 ns | +277.9% |
+| `hundred_stage/try_async_error/last` | 969.315 ns | 859.078 ns | -11.4% |
+| `hundred_stage/try_async_error/middle` | 363.949 ns | 663.789 ns | +82.4% |
+| `hundred_stage/try_async_ready_success` | 739.018 ns | 836.134 ns | +13.1% |
+| `sync_three_stage` | 2.248 ns | 2.303 ns | +2.4% |
+| `try_async_three_stage_ready_success` | 7.015 ns | 7.296 ns | +4.0% |
+
+## Tower: first run
+
+| Case | Direct async fn | skid-pipe | Tower ready + call |
+|---|---:|---:|---:|
+| Try async, 3 stages, success | 7.563 ns | 7.688 ns | 18.637 ns |
+
+Tower/skid-pipe = 2.42x in this fixture. Tower includes a readiness
+and service contract; this comparison does not make skid-pipe a substitute for
+backpressure or middleware. Its stage payload differs from the vs_futures
+benchmark, so compare implementations within each table.
+
+## 100-stage future layout
+
+Measured with the existing measure_footprint example, on the same host and
+default features. This measures inline future storage, not heap allocation or
+total peak stack use.
+
+| Kind | Direct | Pipeline |
+|---|---:|---:|
+| Async | 8 B | 120 B |
+| TryAsync | 8 B | 216 B |
+
+## Reproduction
+
+Use the measured source commit and Rust 1.98.1. This library does not commit a
+Cargo.lock, so a fresh checkout resolves transitive dependencies again;
+matching the direct dependency versions does not guarantee identical results.
+Preserve any existing local lockfile when reproducing a prior environment.
+
+Resolve the dependencies, then compile all benchmark executables before timing:
+
+```sh
+cargo +1.98.1 generate-lockfile
+cargo +1.98.1 update -p futures --precise 0.3.34
+cargo +1.98.1 update -p tokio --precise 1.53.1
+cargo +1.98.1 bench --locked --no-run \
+  --bench vs_futures --bench composition --bench vs_tower
+```
+
+Run the suites sequentially, repeating the futures comparison after the other
+suites. Use the same settings for every run:
+
+```sh
+for bench in vs_futures composition vs_tower vs_futures; do
+  cargo +1.98.1 bench --locked --bench "$bench" -- \
+    --warm-up-time 1 --measurement-time 3 --sample-size 100 --noplot
+done
+cargo +1.98.1 run --locked --release --example measure_footprint
+```
+
+Criterion writes its local reports beneath the ignored `target/criterion`
+directory. The measured values and confidence intervals are retained in this
+document.
+
+## All estimates and 95% confidence intervals
+
+| Run | Benchmark | Estimate (ns) | 95% lower | 95% upper |
+|---|---|---:|---:|---:|
+| first | `async_three_stage_ready/async_pipe` | 4.7236 | 4.5887 | 4.8870 |
+| first | `async_three_stage_ready/direct` | 4.9847 | 4.6960 | 5.3941 |
+| first | `fallible_error/first/direct` | 3.4591 | 2.8519 | 4.1834 |
+| first | `fallible_error/first/try_pipe` | 2.3746 | 2.2470 | 2.5326 |
+| first | `fallible_error/last/direct` | 9.2601 | 8.7724 | 9.9257 |
+| first | `fallible_error/last/try_pipe` | 10.9016 | 10.6270 | 11.2476 |
+| first | `fallible_error/middle/direct` | 11.0922 | 9.8576 | 12.4561 |
+| first | `fallible_error/middle/try_pipe` | 10.7267 | 9.1892 | 12.6822 |
+| first | `fallible_success/1_stage/direct` | 1.5437 | 1.4932 | 1.5956 |
+| first | `fallible_success/1_stage/try_pipe` | 1.6102 | 1.5628 | 1.6566 |
+| first | `fallible_success/3_stage/direct` | 3.5433 | 3.3443 | 3.8742 |
+| first | `fallible_success/3_stage/try_pipe` | 3.9906 | 3.9374 | 4.0565 |
+| first | `fallible_success/8_stage/direct` | 9.4519 | 8.8999 | 10.2812 |
+| first | `fallible_success/8_stage/try_pipe` | 11.0912 | 10.7497 | 11.5081 |
+| first | `fallible_type_changing_success/direct` | 4.4044 | 4.2690 | 4.5727 |
+| first | `fallible_type_changing_success/try_pipe` | 4.4824 | 4.3231 | 4.6778 |
+| first | `hundred_stage/async_ready_success/async_pipe` | 765.7816 | 757.2986 | 781.5069 |
+| first | `hundred_stage/async_ready_success/direct` | 782.3963 | 739.2321 | 863.0778 |
+| first | `hundred_stage/fallible_error/first/direct` | 6.1941 | 5.4047 | 7.2657 |
+| first | `hundred_stage/fallible_error/first/try_pipe` | 9.2978 | 7.3156 | 11.9608 |
+| first | `hundred_stage/fallible_error/last/direct` | 780.6612 | 754.6460 | 813.6696 |
+| first | `hundred_stage/fallible_error/last/try_pipe` | 753.4568 | 745.2099 | 764.8597 |
+| first | `hundred_stage/fallible_error/middle/direct` | 548.8608 | 500.4146 | 611.9560 |
+| first | `hundred_stage/fallible_error/middle/try_pipe` | 468.8342 | 397.1819 | 561.9993 |
+| first | `hundred_stage/fallible_success/direct` | 741.5557 | 738.4623 | 745.5538 |
+| first | `hundred_stage/fallible_success/try_pipe` | 765.6876 | 748.8195 | 790.0269 |
+| first | `hundred_stage/sync_success/direct` | 602.9498 | 573.8946 | 649.7853 |
+| first | `hundred_stage/sync_success/pipe` | 566.8670 | 557.9241 | 581.3901 |
+| first | `hundred_stage/try_async_error/first/direct` | 4.5215 | 4.1456 | 5.0516 |
+| first | `hundred_stage/try_async_error/first/try_async_pipe` | 17.0870 | 16.0854 | 18.6629 |
+| first | `hundred_stage/try_async_error/last/direct` | 969.3146 | 819.6727 | 1216.4631 |
+| first | `hundred_stage/try_async_error/last/try_async_pipe` | 859.0780 | 804.2614 | 941.4640 |
+| first | `hundred_stage/try_async_error/middle/direct` | 363.9490 | 356.7868 | 373.6511 |
+| first | `hundred_stage/try_async_error/middle/try_async_pipe` | 663.7893 | 616.7580 | 712.9173 |
+| first | `hundred_stage/try_async_ready_success/direct` | 739.0180 | 733.9778 | 745.7180 |
+| first | `hundred_stage/try_async_ready_success/try_async_pipe` | 836.1341 | 811.5408 | 888.5358 |
+| first | `sync_three_stage/direct` | 2.2484 | 2.2432 | 2.2551 |
+| first | `sync_three_stage/pipe` | 2.3033 | 2.2517 | 2.3691 |
+| first | `try_async_three_stage_ready_success/direct` | 7.0155 | 6.9246 | 7.1256 |
+| first | `try_async_three_stage_ready_success/try_async_pipe` | 7.2964 | 6.9764 | 7.7683 |
+| first | `vs_futures/async_10_stage_success/direct_async_fn` | 38.4984 | 38.0816 | 39.0618 |
+| first | `vs_futures/async_10_stage_success/futures_then` | 95.9638 | 94.6020 | 97.6748 |
+| first | `vs_futures/async_10_stage_success/skid_pipe` | 39.5885 | 38.6649 | 40.7070 |
+| first | `vs_futures/async_3_stage_success/direct_async_fn` | 7.8149 | 7.6693 | 8.0002 |
+| first | `vs_futures/async_3_stage_success/futures_then` | 26.8743 | 25.5362 | 28.6475 |
+| first | `vs_futures/async_3_stage_success/skid_pipe` | 8.9022 | 8.0942 | 10.2960 |
+| first | `vs_futures/try_async_10_stage_first_error/direct_async_fn` | 4.7049 | 4.3482 | 5.1397 |
+| first | `vs_futures/try_async_10_stage_first_error/futures_and_then` | 23.6532 | 23.3786 | 24.0721 |
+| first | `vs_futures/try_async_10_stage_first_error/skid_pipe` | 4.5570 | 4.3423 | 4.8994 |
+| first | `vs_futures/try_async_3_stage_first_error/direct_async_fn` | 4.3017 | 4.1586 | 4.6109 |
+| first | `vs_futures/try_async_3_stage_first_error/futures_and_then` | 8.5152 | 8.3699 | 8.6914 |
+| first | `vs_futures/try_async_3_stage_first_error/skid_pipe` | 4.1788 | 4.1595 | 4.2130 |
+| first | `vs_futures/try_async_3_stage_success/direct_async_fn` | 15.0472 | 14.4889 | 15.5978 |
+| first | `vs_futures/try_async_3_stage_success/futures_and_then` | 27.8530 | 26.5347 | 29.4683 |
+| first | `vs_futures/try_async_3_stage_success/skid_pipe` | 13.6593 | 13.1513 | 14.2016 |
+| first | `vs_tower/try_async_3_stage_success/direct_async_fn` | 7.5632 | 7.3338 | 7.8320 |
+| first | `vs_tower/try_async_3_stage_success/skid_pipe` | 7.6885 | 7.4257 | 8.0463 |
+| first | `vs_tower/try_async_3_stage_success/tower_ready_call` | 18.6365 | 18.2246 | 19.1190 |
+| repeat | `vs_futures/async_10_stage_success/direct_async_fn` | 38.4264 | 38.1932 | 38.7527 |
+| repeat | `vs_futures/async_10_stage_success/futures_then` | 98.4047 | 95.3031 | 104.1902 |
+| repeat | `vs_futures/async_10_stage_success/skid_pipe` | 38.3883 | 38.1979 | 38.6577 |
+| repeat | `vs_futures/async_3_stage_success/direct_async_fn` | 8.3305 | 8.0675 | 8.6509 |
+| repeat | `vs_futures/async_3_stage_success/futures_then` | 27.0045 | 25.9610 | 29.1020 |
+| repeat | `vs_futures/async_3_stage_success/skid_pipe` | 8.2128 | 7.9438 | 8.5624 |
+| repeat | `vs_futures/try_async_10_stage_first_error/direct_async_fn` | 4.5055 | 4.4469 | 4.5712 |
+| repeat | `vs_futures/try_async_10_stage_first_error/futures_and_then` | 27.2806 | 25.4363 | 29.9836 |
+| repeat | `vs_futures/try_async_10_stage_first_error/skid_pipe` | 4.5510 | 4.4469 | 4.6744 |
+| repeat | `vs_futures/try_async_3_stage_first_error/direct_async_fn` | 4.5993 | 4.4368 | 4.8041 |
+| repeat | `vs_futures/try_async_3_stage_first_error/futures_and_then` | 9.3843 | 8.9081 | 10.0575 |
+| repeat | `vs_futures/try_async_3_stage_first_error/skid_pipe` | 4.5260 | 4.4310 | 4.6397 |
+| repeat | `vs_futures/try_async_3_stage_success/direct_async_fn` | 14.5014 | 13.9298 | 15.0794 |
+| repeat | `vs_futures/try_async_3_stage_success/futures_and_then` | 29.0887 | 28.3094 | 30.0810 |
+| repeat | `vs_futures/try_async_3_stage_success/skid_pipe` | 14.1478 | 13.5650 | 14.8361 |
+
+## Historical results and optimization notes
+
+The material below describes older source revisions measured primarily on
+Intel/WSL2 with Rust 1.86. Its tables and implementation descriptions are
+historical, including the old async state machines and state-retention notes.
+Use the current results above for the latest comparison. The Cortex-M size
+probes and optimization experiments below were not repeated in this run.
 
 This is a machine-local comparison, not a performance guarantee. Every row
 uses equivalent stage functions on both sides, keeps pipeline construction
@@ -15,14 +221,14 @@ measurement window and 100 samples):
 - Intel Core i9-9900K, 4 logical CPUs exposed to the guest
 - Criterion 0.8.2, 1 second warm-up, 3 second measurement, 100 samples
 
-Run the maintained benchmark with:
+The original snapshot used this command on its historical checkout:
 
 ```sh
 cargo +1.86 bench --bench composition -- \
   --warm-up-time 1 --measurement-time 3 --sample-size 100
 ```
 
-## Short chains
+### Short chains
 
 Times are Criterion point estimates. Delta is `(pipeline / direct) - 1`.
 
@@ -45,7 +251,7 @@ fallible machinery's own cost: this group's stages are not the ones the
 Measured against an infallible pipeline over the *same* payload and stage
 shape, the fallible one costs about 20 percentage points more, not 110.
 
-## 100-stage chains
+### 100-stage chains
 
 | Case | Direct | Pipeline | Delta |
 |---|---:|---:|---:|
@@ -82,7 +288,7 @@ to 6.0441 ns, so the delta grew from +1.69% to +7.94% without the pipeline
 getting slower. At six nanoseconds these arms are dominated by run-to-run
 variation, and the delta column should not be read as a regression.
 
-## Future layout and Cortex-M code size
+### Future layout and Cortex-M code size
 
 `size_of_val` measurements for the 100-stage ready-future workload were:
 
@@ -156,7 +362,7 @@ The fixture also exports four `*_future_bytes` functions so a target
 disassembler can verify the returned layout constants without executing the
 firmware image.
 
-## Rejected optimizations
+### Rejected optimizations
 
 Three changes aimed at the two `TryAsyncPipe` rows above were implemented and
 measured against this snapshot's machine. Two are recorded here so the same
@@ -205,7 +411,7 @@ Two of the three were predicted to help from reading the code and did not.
 Treat the per-layer costs above as measured, and anything about why they are
 what they are as a hypothesis until a benchmark says otherwise.
 
-## Against the `futures` combinators
+### Against the `futures` combinators
 
 `benches/vs_futures.rs` puts three arms on identical stage bodies, payloads and
 `Ready` futures. `skid_pipe` builds its pipeline once outside the loop and calls
@@ -266,7 +472,7 @@ cargo bench --bench vs_futures -- \
   --warm-up-time 1 --measurement-time 3 --sample-size 100
 ```
 
-## Against Tower services
+### Against Tower services
 
 Tower is a useful adjacent comparison, but not a substitute for this crate.
 Its unit of composition is a request/response `Service` with a readiness
@@ -301,7 +507,7 @@ cargo +1.86 bench --bench vs_tower -- \
   --warm-up-time 1 --measurement-time 3 --sample-size 100
 ```
 
-## Other pipeline libraries
+### Other pipeline libraries
 
 The following crates should not be put in the nanosecond single-item table;
 their execution models answer different questions. A valid comparison needs a
@@ -320,7 +526,7 @@ allocation, context lookup, or dispatch strategy look like a defect rather
 than the feature the caller chose. Add a workload-specific suite before making
 a throughput claim across those categories.
 
-## The async-block rewrite (0.3.0)
+### The async-block rewrite (0.3.0)
 
 0.3.0 replaced the hand-written state machines in `src/future.rs` with one
 `async` block per group of stages. The composition shape is the one those

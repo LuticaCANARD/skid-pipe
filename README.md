@@ -537,30 +537,34 @@ async stages. The difference is that it composes futures, so a caller running
 the same computation twice builds the chain twice. `benches/vs_futures.rs`
 measures that on identical stage bodies, payloads, and `Ready` futures:
 
-| Group | plain `async fn` | `skid-pipe` | `futures` |
-|---|---:|---:|---:|
-| async, 3 stages | 12.750 ns | 23.518 ns | 41.611 ns |
-| `try` async, 3 stages | 35.221 ns | 43.561 ns | 49.326 ns |
-| `try` async, 3 stages, first error | 11.715 ns | 19.292 ns | 25.322 ns |
-| async, 10 stages | 44.015 ns | 57.716 ns | 153.390 ns |
-| `try` async, 10 stages, first error | 11.464 ns | 19.583 ns | 74.135 ns |
+The [2026-09-12 remeasurement](BENCHMARKS.md)
+used Rust 1.98.1 on Apple M1/macOS. Ranges below span the point estimates of
+two runs with identical settings; they are not confidence intervals.
 
-`skid-pipe` is 1.1x to 1.8x faster than the combinators at three stages and
-2.7x to 3.8x at ten, the gap widening because the rebuild scales with the chain
-while `run` only issues a future for a pipeline that already exists.
+| Case | Direct async fn | skid-pipe | futures | futures / skid-pipe |
+|---|---:|---:|---:|---:|
+| Async, 3 stages | 7.81–8.33 ns | 8.21–8.90 ns | 26.87–27.00 ns | 3.02–3.29x |
+| Try async, 3 stages | 14.50–15.05 ns | 13.66–14.15 ns | 27.85–29.09 ns | 2.04–2.06x |
+| Try async, 3 stages, first error | 4.30–4.60 ns | 4.18–4.53 ns | 8.52–9.38 ns | 2.04–2.07x |
+| Async, 10 stages | 38.43–38.50 ns | 38.39–39.59 ns | 95.96–98.40 ns | 2.42–2.56x |
+| Try async, 10 stages, first error | 4.51–4.70 ns | 4.55–4.56 ns | 23.65–27.28 ns | 5.19–5.99x |
 
-The last column is also the answer to a question this file raises elsewhere:
-first-error short-circuiting is `TryAsyncPipe`'s worst result against direct
-calls, and `and_then` on the same shape costs more of it. That overhead is what
-static async composition costs, not something this crate does badly.
+In these fixtures, skid-pipe takes 67–70% less time than futures at three
+ordinary async stages and 59–61% less at ten. The fallible first-error case
+at ten stages takes 81–83% less time. Pipeline construction is outside the
+loop, while each futures chain is rebuilt inside it.
 
-**A plain `async fn` beats both crates in every group**, by 24% to 85% against
-`skid-pipe`. It is also reusable — you can call it as often as you like. What it
-cannot do is be assembled: its stages are fixed where it is written, it cannot
-be built conditionally or returned from a builder as one typed value, and each
-connection is checked only inside its own body. That is what `skid-pipe` sells,
-and it is not speed. When the chain is short and lives in one place, write the
-`async fn`.
+Direct async fn and skid-pipe are close on the ordinary three- and ten-stage
+workloads; their ordering can change between runs. This does not establish a
+consistent speed advantage over direct code. A long pipeline also has costs:
+the separate 100-stage TryAsyncPipe first-error fixture takes 17.09 ns versus
+4.52 ns directly. The report retains all results and confidence intervals.
+
+These measurements exercise immediately-ready futures and do not predict
+network/DB throughput or executor scheduling. The older Intel/WSL2 snapshot
+uses a different compiler and machine and is not a Rust-upgrade comparison.
+Use skid-pipe when the assembled computation should be a reusable typed value;
+a short, fixed computation remains straightforward as an ordinary async fn.
 
 State across calls can live in a `FnMut` stage or a named stage that lends its
 state to its future. A plain `async fn` can similarly accept mutable state as an
@@ -575,13 +579,13 @@ normal `ready().await.call()` path:
 
 | Group | plain `async fn` | `skid-pipe` | Tower ready + call |
 |---|---:|---:|---:|
-| try async, 3 stages, success | 11.913 ns | 20.050 ns | 30.783 ns |
+| try async, 3 stages, success | 7.563 ns | 7.688 ns | 18.637 ns |
 
-That is a 1.54x Tower/`skid-pipe` ratio in this machine-local run. It does not
-make Tower a poor choice: the measured difference is the cost of a service
-protocol this crate intentionally does not implement. Use Tower for readiness,
-backpressure, timeout, retry, and request/response middleware; use
-`skid-pipe` for a local, typed computation chain.
+The Rust 1.98.1 remeasurement gives a 2.42x Tower/skid-pipe ratio in this
+fixture. Tower provides a readiness and service contract that skid-pipe does
+not implement. Its payload differs from the futures benchmark above, so
+compare the implementations within each table. Use Tower for service
+readiness and backpressure; use skid-pipe for a local, typed computation chain.
 
 Task/channel pipeline crates (`async-pipes`, `pumps`, and `pipelines`),
 type-keyed workflow kits (`pipeline-toolkit`), and scratchpad executors
