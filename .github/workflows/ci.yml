@@ -61,6 +61,22 @@ jobs:
       - run: cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
       - run: cargo check --target thumbv6m-none-eabi --features wide
 
+  portable-sensor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: rustfmt, clippy
+          targets: wasm32-wasip1,wasm32v1-none,thumbv6m-none-eabi,thumbv7em-none-eabihf,riscv32imac-unknown-none-elf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: cargo fmt --manifest-path examples/portable-sensor/Cargo.toml --check
+      - run: cargo clippy --manifest-path examples/portable-sensor/Cargo.toml --all-targets --features host -- -D warnings
+      - run: python3 scripts/check-portable-sensor.py
+
   miri:
     runs-on: ubuntu-latest
     env:

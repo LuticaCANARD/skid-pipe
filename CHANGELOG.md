@@ -6,7 +6,16 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Because the public API is still pre-1.0, minor releases may contain breaking
 API changes. See the compatibility policy in the README before upgrading.
 
-## [Unreleased]
+## [0.4.0] - 2026-09-13
+
+### Added
+
+- Synchronous chain-as-stage composition: `Pipe::from_chain`, `Pipe::then_chain`,
+  and `ChainStage<C>` preserve state and static types across opaque `impl Chain`
+  module boundaries without allocation.
+- A shared `no_std` sensor demo with native and Wasm replay, expected observations,
+  and core-only Wasm, ARM, and RISC-V compile checks. Hardware execution remains
+  unvalidated.
 
 ### Fixed
 
@@ -22,6 +31,14 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ### Changed
 
+- Refresh the benchmark snapshot on 2026-09-13 for the chain-as-stage API,
+  including a direct module-composition measurement. The new run uses Rust
+  1.98.1 on WSL2/Linux with an Intel i9-9900K; the 2026-09-12 Apple M1 run is
+  retained as historical data.
+- Position the crate around reusable, stateful computation for embedded, Wasm,
+  and native Rust; lead the README with module composition and a shared demo.
+- Clarify that zero-allocation composition does not constrain allocations inside
+  user stages, and that direct functions remain suitable for fixed computations.
 - Raise the MSRV from Rust 1.86 to Rust 1.98.1. Pin the repository toolchain to
   1.98.1 and test both that version and stable in CI. Update the pinned Miri
   nightly to 2026-09-10 to meet the new MSRV. Rust 1.86-specific
@@ -287,7 +304,8 @@ No code migration is required from 0.1.0.
 - Added native, WebAssembly, and embedded target validation with Rust 1.86 as
   the minimum supported Rust version (MSRV).
 
-[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/LuticaCANARD/skid-pipe/compare/v0.1.2...v0.2.0

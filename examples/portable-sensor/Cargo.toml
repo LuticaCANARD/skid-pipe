@@ -1,0 +1,19 @@
+[package]
+name = "portable-sensor"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+host = []
+
+[dependencies]
+skid-pipe = { path = "../.." }
+
+[[bin]]
+name = "sensor-replay"
+path = "src/main.rs"
+required-features = ["host"]

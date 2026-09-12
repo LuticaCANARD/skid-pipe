@@ -2,7 +2,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
 
-//! Portable, typed composition of ordinary Rust functions.
+//! Reusable, stateful computation pipelines for embedded, Wasm, and native Rust.
+//!
+//! Build computation modules as values and compose them with
+//! [`Pipe::from_chain`] and [`Pipe::then_chain`]. Composition uses no allocation;
+//! user-provided stages remain responsible for their own resource use.
 //!
 //! `skid-pipe`'s default feature set is dependency-free and uses only [`core`].
 //! It adds no allocator, dynamic dispatch, runtime, or executor requirement,
@@ -188,7 +192,7 @@ mod try_async_pipe;
 mod try_pipe;
 
 pub use async_pipe::{AsyncChain, AsyncChainSend, AsyncPipe, AsyncStep};
-pub use pipe::{Chain, End, Pipe, Step};
+pub use pipe::{Chain, ChainStage, End, Pipe, Step};
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use tokio::{TokioAsyncChainExt, TokioTryAsyncChainExt};

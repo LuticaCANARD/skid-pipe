@@ -6,7 +6,7 @@ use std::{
 };
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use skid_pipe::{AsyncPipe, Pipe, TryAsyncPipe, TryPipe};
+use skid_pipe::{AsyncPipe, Chain, Pipe, TryAsyncPipe, TryPipe};
 
 // `append_*!` / `await_ten!` / `apply_hundred!` live here so the benches, the
 // footprint example and the no_std fixture all build the same 100 stages.
@@ -63,6 +63,14 @@ fn classify(input: f32) -> bool {
 
 fn direct_sync(input: u16) -> bool {
     classify(normalize(decode(input)))
+}
+
+fn build_decode_normalize() -> impl Chain<u16, Output = f32> {
+    Pipe::new(decode).then(normalize)
+}
+
+fn build_classify() -> impl Chain<f32, Output = bool> {
+    Pipe::new(classify)
 }
 
 #[inline(never)]
@@ -250,6 +258,12 @@ fn bench_sync(c: &mut Criterion) {
     let mut pipeline = Pipe::new(decode).then(normalize).then(classify);
     group.bench_function("pipe", |bencher| {
         bencher.iter(|| black_box(pipeline.run(black_box(INPUT))));
+    });
+
+    let mut module_pipeline =
+        Pipe::from_chain(build_decode_normalize()).then_chain(build_classify());
+    group.bench_function("module_composed", |bencher| {
+        bencher.iter(|| black_box(module_pipeline.run(black_box(INPUT))));
     });
 
     group.finish();

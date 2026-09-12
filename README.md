@@ -2,42 +2,66 @@
 
 # skid-pipe
 
-> Reusable, state-capable, fully static computation pipelines for Rust `core`.
+> Reusable, stateful computation pipelines with zero-allocation composition
+> for embedded, Wasm, and native Rust.
 
-`skid-pipe` turns a chain of ordinary Rust functions into a reusable value.
-Its default core uses only `core`:
+Build sensor preprocessing, stateful filters, or model pre/post-processing as
+typed computation modules. Compose those modules once, then run them for each
+input while retaining their state. Share the computation across firmware,
+simulation, and native replay; keep device I/O in the caller.
+
+The default library uses only Rust `core`:
 
 - `no_std`
 - zero default library dependencies
-- zero allocation
+- zero allocation in composition (stages control their own resource use)
 - static dispatch
 - no runtime or executor
 - no `unsafe` anywhere in the crate (`#![forbid(unsafe_code)]`)
 - native, WebAssembly, and embedded-core compatible
 
-It is not an immediate-value pipe operator, a `Result`-only framework, or a
-network middleware stack. It is for defining an ordinary computation once and
-running that same typed computation repeatedly.
-
 ```rust
-use skid_pipe::Pipe;
+use skid_pipe::{Chain, Pipe};
 
-let mut classify = Pipe::new(|raw: u16| raw as f32 / 4095.0)
-    .then(|ratio: f32| ratio > 0.5);
+fn preprocessing(offset: u16) -> impl Chain<u16, Output = u16> {
+    Pipe::new(move |raw: u16| raw.saturating_sub(offset).min(4095))
+}
 
-assert!(classify.run(3000));
-assert!(!classify.run(100));
+fn decision() -> impl Chain<u16, Output = bool> {
+    let mut high = false;
+    Pipe::new(move |level: u16| {
+        if level >= 3000 { high = true; }
+        else if level <= 2000 { high = false; }
+        high
+    })
+}
+
+let mut sensor = Pipe::from_chain(preprocessing(100))
+    .then_chain(decision());
+
+assert!(sensor.run(3200));
+assert!(sensor.run(2600)); // retains the decision between thresholds
+assert!(!sensor.run(1500));
 ```
 
-Each stage may change the value type. Rust checks every adjacent connection:
+Each module may change the value type. The composed chain statically checks
+every connection, including modules returned as opaque `impl Chain` values.
+The [portable sensor demo](examples/portable-sensor/README.md) expands this into
+decode, calibration, filtering, feature extraction, and classification:
 
 ```text
-u16 ──▶ f32 ──▶ bool
+Native replay ─────┐
+Wasm replay ───────┼──▶ one shared no_std sensor module ──▶ observations
+Firmware adapter ─┘
 ```
+
+The demo executes native and Wasm replay and checks their results. Firmware
+targets are compile-checked; MCU hardware execution is not yet validated.
 
 ## When it earns its keep
 
-Use plain Rust when a computation runs once:
+Use plain Rust when a short, fixed computation is already clear, even if it
+runs repeatedly:
 
 ```rust
 # fn normalize(raw: u8) -> Result<u16, ()> { Ok(u16::from(raw)) }
@@ -53,11 +77,33 @@ Use `skid-pipe` when the composed computation itself must become a value that
 you can:
 
 - build in one module and return as `impl Chain`;
+- compose with other modules through `from_chain` and `then_chain`;
 - run repeatedly while `FnMut` stages retain state;
 - reuse across native, Wasm, and `no_std` targets.
 
-This crate does not replace Rust control flow. Branches remain ordinary
-`if`/`match` expressions inside stages.
+Ordinary functions and closures can also be portable, stateful, and allocation-free.
+This crate supplies a common stage/chain contract for assembling those computations;
+it does not make a `.then()` expression intrinsically faster or more portable.
+Branches remain ordinary `if`/`match` expressions inside stages. Sampling cadence,
+queues, missing inputs, and concurrency remain the caller's responsibility.
+
+## Compose computation modules
+
+`Pipe::from_chain(module)` starts a synchronous pipeline from any `Chain`, and
+`.then_chain(module)` appends another chain. Both own the supplied module through
+the public `ChainStage<C>` adapter. Construction does not run stages; each run
+executes them in order and preserves their existing state. `.then(stage)` still
+accepts ordinary functions, closures, and named `Step` implementations.
+
+These adapters also work with builders returning `impl Chain` and chains that
+borrow local state. They do not box, erase, clone, or reset a module. Rebuild a
+module explicitly when a new input stream needs fresh state. As with `.then()`,
+incompatible types are rejected when the result is used as a `Chain`, such as
+at `run()` or a typed builder boundary.
+
+Chain-as-stage currently covers synchronous `Pipe`. Fallible and async adapters
+need their own error, borrow, and cancellation contracts before being added.
+The existing `TryPipe`, `AsyncPipe`, and `TryAsyncPipe` APIs remain available.
 
 ## Why this shape
 
@@ -131,10 +177,10 @@ Treat the resulting nanoseconds as machine-local evidence, not a portable
 performance promise. Flash size, stack use, and assembly require target-specific
 measurement before making embedded optimization claims.
 
-The checked-in [benchmark snapshot](BENCHMARKS.md) records the full direct
-comparison, including 100-stage runtime, future layout, and a Cortex-M code
-size probe. It intentionally reports the unfavorable long-async cases too, and
-records three optimizations that were measured and did not land.
+The checked-in [benchmark snapshot](BENCHMARKS.md) records the current direct
+comparison, module-composition case, 100-stage runtime, future layout, and the
+historical Cortex-M code-size probe. It intentionally reports unfavorable
+long-async cases too.
 
 A second benchmark, `benches/vs_futures.rs`, compares composition against the
 `futures` combinators and against a plain `async fn`. See
@@ -148,6 +194,7 @@ implements a service contract rather than a local function pipeline.
 
 | Example | Demonstrates | Run |
 |---|---|---|
+| [Portable sensor](examples/portable-sensor/README.md) | Shared stateful modules; native/Wasm execution comparison; firmware compilation | `python3 scripts/check-portable-sensor.py` |
 | [`typed_sensor.rs`](examples/typed_sensor.rs) | Type-changing embedded-style processing | `cargo run --example typed_sensor` |
 | [`fallible_protocol.rs`](examples/fallible_protocol.rs) | First-error short-circuiting | `cargo run --example fallible_protocol` |
 | [`stateful_router.rs`](examples/stateful_router.rs) | Branching and state retained across runs | `cargo run --example stateful_router` |
@@ -345,7 +392,7 @@ Enable the optional integration when the application already uses Tokio:
 
 ```toml
 [dependencies]
-skid-pipe = { version = "0.3", features = ["tokio"] }
+skid-pipe = { version = "0.4", features = ["tokio"] }
 ```
 
 The feature enables Tokio's minimal `rt` feature and exports two extension
@@ -537,28 +584,30 @@ async stages. The difference is that it composes futures, so a caller running
 the same computation twice builds the chain twice. `benches/vs_futures.rs`
 measures that on identical stage bodies, payloads, and `Ready` futures:
 
-The [2026-09-12 remeasurement](BENCHMARKS.md)
-used Rust 1.98.1 on Apple M1/macOS. Ranges below span the point estimates of
-two runs with identical settings; they are not confidence intervals.
+The [2026-09-13 remeasurement](BENCHMARKS.md)
+used Rust 1.98.1 on an Intel i9-9900K under WSL2/Linux. Ranges below span the
+point estimates of two runs with identical settings; they are not confidence
+intervals.
 
 | Case | Direct async fn | skid-pipe | futures | futures / skid-pipe |
 |---|---:|---:|---:|---:|
-| Async, 3 stages | 7.81–8.33 ns | 8.21–8.90 ns | 26.87–27.00 ns | 3.02–3.29x |
-| Try async, 3 stages | 14.50–15.05 ns | 13.66–14.15 ns | 27.85–29.09 ns | 2.04–2.06x |
-| Try async, 3 stages, first error | 4.30–4.60 ns | 4.18–4.53 ns | 8.52–9.38 ns | 2.04–2.07x |
-| Async, 10 stages | 38.43–38.50 ns | 38.39–39.59 ns | 95.96–98.40 ns | 2.42–2.56x |
-| Try async, 10 stages, first error | 4.51–4.70 ns | 4.55–4.56 ns | 23.65–27.28 ns | 5.19–5.99x |
+| Async, 3 stages | 9.516–10.153 ns | 9.474–9.858 ns | 30.452–30.490 ns | 3.09–3.22x |
+| Try async, 3 stages | 14.068–16.277 ns | 14.101–15.801 ns | 33.444–34.076 ns | 2.12–2.42x |
+| Try async, 3 stages, first error | 8.348–8.566 ns | 8.326–8.856 ns | 18.411–21.453 ns | 2.08–2.58x |
+| Async, 10 stages | 31.751–40.519 ns | 32.061–32.775 ns | 102.23–139.48 ns | 3.12–4.35x |
+| Try async, 10 stages, first error | 9.269–18.866 ns | 11.879–11.950 ns | 53.741–79.262 ns | 4.50–6.67x |
 
-In these fixtures, skid-pipe takes 67–70% less time than futures at three
-ordinary async stages and 59–61% less at ten. The fallible first-error case
-at ten stages takes 81–83% less time. Pipeline construction is outside the
-loop, while each futures chain is rebuilt inside it.
+In these fixtures, skid-pipe takes about 68–69% less time than futures at three
+ordinary async stages and 68–77% less at ten. The fallible first-error case at
+ten stages takes 78–85% less time. Pipeline construction is outside the loop,
+while each futures chain is rebuilt inside it.
 
 Direct async fn and skid-pipe are close on the ordinary three- and ten-stage
 workloads; their ordering can change between runs. This does not establish a
 consistent speed advantage over direct code. A long pipeline also has costs:
-the separate 100-stage TryAsyncPipe first-error fixture takes 17.09 ns versus
-4.52 ns directly. The report retains all results and confidence intervals.
+the separate 100-stage TryAsyncPipe first-error fixture takes 21.34 ns versus
+7.87 ns directly in this run. The report retains the previous run's full
+confidence-interval appendix and the current point-estimate tables.
 
 These measurements exercise immediately-ready futures and do not predict
 network/DB throughput or executor scheduling. The older Intel/WSL2 snapshot
@@ -579,9 +628,9 @@ normal `ready().await.call()` path:
 
 | Group | plain `async fn` | `skid-pipe` | Tower ready + call |
 |---|---:|---:|---:|
-| try async, 3 stages, success | 7.563 ns | 7.688 ns | 18.637 ns |
+| try async, 3 stages, success | 12.654 ns | 13.896 ns | 35.703 ns |
 
-The Rust 1.98.1 remeasurement gives a 2.42x Tower/skid-pipe ratio in this
+The Rust 1.98.1 remeasurement gives a 2.57x Tower/skid-pipe ratio in this
 fixture. Tower provides a readiness and service contract that skid-pipe does
 not implement. Its payload differs from the futures benchmark above, so
 compare the implementations within each table. Use Tower for service
@@ -627,6 +676,13 @@ including representative targets:
 
 The core stays ecosystem-neutral. Integrations that require a HAL, executor,
 logging framework, or model runtime belong in separate adapter crates.
+
+The portable sensor CI job additionally executes the same shared Rust computation
+as a native binary and as `wasm32-wasip1` under Node's WASI host. It compares 77
+samples across three fresh streams and checks an explicit expected result for
+the default replay. The integer demo avoids floating-point tolerance differences.
+Its core-only Wasm, ARM, and RISC-V checks establish compilation, not hardware
+execution, real-time deadlines, or target memory use.
 
 ## Versioning and compatibility
 

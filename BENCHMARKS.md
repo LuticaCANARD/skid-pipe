@@ -1,10 +1,100 @@
 # Benchmarks
 
-Latest measurement: 2026-09-12, Rust 1.98.1.
+Latest measurement: 2026-09-13, Rust 1.98.1.
 
-Measured source: `f35d74d3120f636a8ae1fac30999fcc0e8f62d05` (package metadata still says 0.3.0; these are the newer committed sources, not the published 0.3.0 release).
+Measured source: working tree based on `753b6f68fbd583d2bfd47683fe1077a499e532ba`; includes the uncommitted `from_chain`/`then_chain` API and module-composition benchmark.
 
-## Result
+## Current run: 2026-09-13
+
+This run measures the rebased source after adding synchronous chain-as-stage
+composition. It is a new WSL2/Linux measurement, so its values should be
+compared with one another rather than treated as a time-series continuation of
+the Apple M1 snapshot below.
+
+### Environment and method
+
+- Intel Core i9-9900K, 4 logical CPUs exposed to WSL2; Ubuntu 26.04 LTS on AC power.
+- Rust 1.98.1, LLVM 22.1.8, `x86_64-unknown-linux-gnu`; Cargo 1.98.1.
+- Criterion 0.8.2; futures 0.3.34; tower 0.5.3. Default features; `wide` and `tokio` disabled.
+- Each suite used a 1 second warm-up, 3 second measurement, and 100 samples. Suites ran sequentially as `vs_futures`, `composition`, `vs_tower`, `vs_futures`.
+- Pipeline construction stayed outside timed loops. Async comparisons use the same `core::future::Ready` stages on both sides. `module_composed` uses the same synchronous stage functions split into two opaque `impl Chain` modules and joined with `from_chain`/`then_chain`.
+- Estimates below are Criterion point estimates in nanoseconds. The two `vs_futures` runs are shown as point-estimate ranges; they are not confidence intervals. The host was not isolated or affinity-pinned.
+
+### Direct composition: current run
+
+| Case | Direct | Pipe | Module-composed | Module / direct − 1 |
+|---|---:|---:|---:|---:|
+| 3-stage sync | 3.3697 ns | 3.3813 ns | 3.6877 ns | +9.4% |
+| 1-stage fallible success | 7.5031 ns | 7.4772 ns | — | — |
+| 3-stage fallible success | 14.704 ns | 15.857 ns | — | — |
+| 8-stage fallible success | 32.402 ns | 32.745 ns | — | — |
+| Type-changing fallible success | 6.5240 ns | 6.5091 ns | — | — |
+| Fallible error, first | 8.0028 ns | 7.9238 ns | — | — |
+| Fallible error, middle | 18.511 ns | 18.167 ns | — | — |
+| Fallible error, last | 31.841 ns | 33.751 ns | — | — |
+| 100-stage sync success | 269.70 ns | 271.84 ns | — | — |
+| 100-stage fallible success | 334.84 ns | 338.81 ns | — | — |
+| 100-stage async Ready success | 362.85 ns | 423.20 ns | — | — |
+| 100-stage TryAsync Ready success | 341.47 ns | 404.86 ns | — | — |
+| 100-stage TryAsync error, first | 7.8659 ns | 21.343 ns | — | — |
+| 100-stage TryAsync error, middle | 172.58 ns | 213.29 ns | — | — |
+| 100-stage TryAsync error, last | 339.74 ns | 399.81 ns | — | — |
+
+The new module-composed case is about 9.4% slower than the direct call and
+9.1% slower than the flat `Pipe` in this build. It measures the explicit
+module boundary and adapter as well as the stages; it is evidence about the
+cost of this composition shape, not a universal overhead guarantee.
+
+### `futures` comparison: two current runs
+
+| Case | Direct async fn | skid-pipe | futures | futures / skid-pipe |
+|---|---:|---:|---:|---:|
+| Async, 3 stages | 9.516–10.153 ns | 9.474–9.858 ns | 30.452–30.490 ns | 3.09–3.22x |
+| Try async, 3 stages | 14.068–16.277 ns | 14.101–15.801 ns | 33.444–34.076 ns | 2.12–2.42x |
+| Try async, 3 stages, first error | 8.348–8.566 ns | 8.326–8.856 ns | 18.411–21.453 ns | 2.08–2.58x |
+| Async, 10 stages | 31.751–40.519 ns | 32.061–32.775 ns | 102.23–139.48 ns | 3.12–4.35x |
+| Try async, 10 stages, first error | 9.269–18.866 ns | 11.879–11.950 ns | 53.741–79.262 ns | 4.50–6.67x |
+
+### Tower comparison: current run
+
+| Case | Direct async fn | skid-pipe | Tower ready + call |
+|---|---:|---:|---:|
+| Try async, 3 stages, success | 12.654 ns | 13.896 ns | 35.703 ns |
+
+Tower/skid-pipe is 2.57x in this fixture. Tower still provides a readiness and
+service contract; this benchmark does not make it interchangeable with a local
+computation pipeline.
+
+### Future layout: current run
+
+The existing footprint example measured the same inline storage as the previous
+snapshot: Async direct 8 B / pipeline 120 B, and TryAsync direct 8 B / pipeline
+216 B. This measures future storage, not heap allocation or total peak stack use.
+
+### Reproduce current run
+
+Use the working tree based on `753b6f68fbd583d2bfd47683fe1077a499e532ba`, Rust
+1.98.1, and the following commands. A generated `Cargo.lock` is ignored by the
+repository and pins the dependency resolution for this local run.
+
+```sh
+cargo +1.98.1 generate-lockfile
+cargo +1.98.1 update -p futures --precise 0.3.34
+cargo +1.98.1 update -p tokio --precise 1.53.1
+cargo +1.98.1 bench --locked --no-run --benches
+for bench in vs_futures composition vs_tower vs_futures; do
+  cargo +1.98.1 bench --locked --bench "$bench" -- \
+    --warm-up-time 1 --measurement-time 3 --sample-size 100 --noplot
+done
+cargo +1.98.1 run --locked --release --example measure_footprint
+```
+
+## Previous run: 2026-09-12 (Apple M1)
+
+The following section is retained for historical comparison. It is not the
+latest measurement.
+
+### Result
 
 Across two runs, the ordinary async pipeline took 67–70% less time than the
 futures combinator chain at three stages, and 59–61% less at ten stages.
@@ -18,7 +108,7 @@ Long chains still have unfavorable cases. In the composition benchmark,
 4.522 ns directly (3.78x as long), and rejecting in the middle took 663.789 ns
 versus 363.949 ns (+82.4%). These are separate workloads from vs_futures.
 
-## Environment and method
+### Environment and method
 
 - Apple M1, 8 CPU cores, 16 GiB RAM; macOS 26.4.1 (25E253), AC power.
 - Rust 1.98.1, LLVM 22.1.8, aarch64-apple-darwin; Cargo 1.98.1.
@@ -31,7 +121,7 @@ versus 363.949 ns (+82.4%). These are separate workloads from vs_futures.
 - The host was not isolated and CPU affinity was not pinned. Some cases have outliers and wide intervals. Cross-run ranges below are ranges of point estimates, not confidence intervals; small differences are not a stable performance promise.
 - The older Intel/WSL2 + Rust 1.86 snapshot uses different hardware, OS, compiler, and sources. Do not attribute differences from it solely to the Rust upgrade or the recent fixes.
 
-## futures comparison: both runs
+### futures comparison: previous run
 
 | Case | Direct async fn | skid-pipe | futures | futures / skid-pipe |
 |---|---:|---:|---:|---:|
@@ -41,7 +131,7 @@ versus 363.949 ns (+82.4%). These are separate workloads from vs_futures.
 | Async, 10 stages | 38.43–38.50 ns | 38.39–39.59 ns | 95.96–98.40 ns | 2.42–2.56x |
 | Try async, 10 stages, first error | 4.51–4.70 ns | 4.55–4.56 ns | 23.65–27.28 ns | 5.19–5.99x |
 
-## Direct composition: first run
+### Direct composition: first run
 
 | Case | Direct | Pipeline | Pipeline / direct − 1 |
 |---|---:|---:|---:|
@@ -66,7 +156,7 @@ versus 363.949 ns (+82.4%). These are separate workloads from vs_futures.
 | `sync_three_stage` | 2.248 ns | 2.303 ns | +2.4% |
 | `try_async_three_stage_ready_success` | 7.015 ns | 7.296 ns | +4.0% |
 
-## Tower: first run
+### Tower: first run
 
 | Case | Direct async fn | skid-pipe | Tower ready + call |
 |---|---:|---:|---:|
@@ -77,7 +167,7 @@ and service contract; this comparison does not make skid-pipe a substitute for
 backpressure or middleware. Its stage payload differs from the vs_futures
 benchmark, so compare implementations within each table.
 
-## 100-stage future layout
+### 100-stage future layout
 
 Measured with the existing measure_footprint example, on the same host and
 default features. This measures inline future storage, not heap allocation or
@@ -88,7 +178,7 @@ total peak stack use.
 | Async | 8 B | 120 B |
 | TryAsync | 8 B | 216 B |
 
-## Reproduction
+### Reproduction
 
 Use the measured source commit and Rust 1.98.1. This library does not commit a
 Cargo.lock, so a fresh checkout resolves transitive dependencies again;
@@ -120,7 +210,7 @@ Criterion writes its local reports beneath the ignored `target/criterion`
 directory. The measured values and confidence intervals are retained in this
 document.
 
-## All estimates and 95% confidence intervals
+### All estimates and 95% confidence intervals
 
 | Run | Benchmark | Estimate (ns) | 95% lower | 95% upper |
 |---|---|---:|---:|---:|

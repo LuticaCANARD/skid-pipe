@@ -1,8 +1,8 @@
 [package]
 name = "skid-pipe"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-description = "Reusable, state-capable static computation pipelines for Rust core"
+description = "Reusable, stateful computation pipelines with zero-allocation composition for embedded, Wasm, and native Rust"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/LuticaCANARD/skid-pipe"

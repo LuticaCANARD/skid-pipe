@@ -13,6 +13,44 @@ pub struct Pipe<Head, Tail = End> {
     tail: Tail,
 }
 
+/// Adapts a synchronous [`Chain`] to a [`Step`] without allocation or erasure.
+///
+/// The adapter owns its chain and preserves its state between calls. Use
+/// [`Pipe::from_chain`] or [`Pipe::then_chain`] to construct it.
+pub struct ChainStage<C> {
+    chain: C,
+}
+
+impl<C, Input> Step<Input> for ChainStage<C>
+where
+    C: Chain<Input>,
+{
+    type Output = C::Output;
+
+    #[inline(always)]
+    fn call(&mut self, input: Input) -> Self::Output {
+        self.chain.run(input)
+    }
+}
+
+impl<C> Pipe<ChainStage<C>> {
+    /// Starts a pipeline from an existing synchronous chain, including an
+    /// opaque `impl Chain` returned by another module.
+    ///
+    /// ```
+    /// use skid_pipe::{Chain, Pipe};
+    /// fn preprocessing() -> impl Chain<u16, Output = u32> {
+    ///     Pipe::new(|raw: u16| u32::from(raw) * 2)
+    /// }
+    /// let mut pipeline = Pipe::from_chain(preprocessing()).then(|n| n > 10);
+    /// assert!(pipeline.run(6_u16));
+    /// ```
+    #[inline(always)]
+    pub const fn from_chain(chain: C) -> Self {
+        Self::new(ChainStage { chain })
+    }
+}
+
 impl<Head> Pipe<Head> {
     /// Starts a pipeline with its first step.
     #[inline(always)]
@@ -29,6 +67,30 @@ impl<Head, Tail> Pipe<Head, Tail> {
             head: next,
             tail: self,
         }
+    }
+
+    /// Appends a synchronous chain as one stage, preserving its captured state.
+    ///
+    /// Like [`Pipe::then`], connections are checked when the resulting chain
+    /// is required to implement [`Chain`] (for example, by calling `run`).
+    ///
+    /// ```
+    /// use skid_pipe::Pipe;
+    /// let first = Pipe::new(|n: u8| u16::from(n) + 1);
+    /// let second = Pipe::new(|n: u16| n * 2);
+    /// let mut pipeline = Pipe::from_chain(first).then_chain(second);
+    /// assert_eq!(pipeline.run(4_u8), 10);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use skid_pipe::Pipe;
+    /// let mut pipeline = Pipe::new(|n: u8| u16::from(n))
+    ///     .then_chain(Pipe::new(|flag: bool| !flag));
+    /// pipeline.run(1_u8); // u16 cannot connect to bool
+    /// ```
+    #[inline(always)]
+    pub const fn then_chain<C>(self, chain: C) -> Pipe<ChainStage<C>, Self> {
+        self.then(ChainStage { chain })
     }
 
     /// Runs the pipeline for one input value.
