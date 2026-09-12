@@ -11,10 +11,13 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Override rust-toolchain.toml so the stable leg tests stable as intended.
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ["1.98", stable]
+        toolchain: ["1.98.1", stable]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -27,14 +30,14 @@ jobs:
       # within 1.x before, and an unpinned resolve would fail this leg on an
       # unrelated PR. Bump together with the floor in Cargo.toml.
       - name: Pin tokio on the MSRV toolchain
-        if: matrix.toolchain == '1.86'
+        if: matrix.toolchain == '1.98.1'
         run: cargo update -p tokio --precise 1.53.0
       # Same reasoning for the benchmark-only `futures`: `cargo test` and
       # `cargo clippy --all-targets` build dev-dependencies, so an unpinned
       # resolve can fail this leg on an unrelated PR. Bump with the floor in
       # Cargo.toml.
       - name: Pin futures on the MSRV toolchain
-        if: matrix.toolchain == '1.86'
+        if: matrix.toolchain == '1.98.1'
         run: cargo update -p futures --precise 0.3.34
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -60,15 +63,18 @@ jobs:
 
   miri:
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-09-10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-03
+          toolchain: nightly-2026-09-10
           components: miri
       - run: >-
           cargo miri test
           --test async_pipeline
+          --test borrowed_send
           --test erasure
           --test try_async_pipeline
           --test hundred_stages
@@ -77,6 +83,7 @@ jobs:
       - run: >-
           cargo miri test --features wide
           --test async_pipeline
+          --test borrowed_send
           --test erasure
           --test try_async_pipeline
           --test hundred_stages

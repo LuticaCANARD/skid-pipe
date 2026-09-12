@@ -39,7 +39,7 @@ pub trait TokioAsyncChainExt<Input>: AsyncChain<Input> + Sized {
     #[inline]
     fn spawn(self, input: Input) -> tokio::task::JoinHandle<Self::Output>
     where
-        Self: AsyncChainSend<Input> + Send + 'static,
+        Self: for<'run> AsyncChainSend<'run, Input> + Send + 'static,
         Input: Send + 'static,
         Self::Output: Send + 'static,
     {
@@ -93,7 +93,7 @@ pub trait TokioTryAsyncChainExt<Input, Error>: TryAsyncChain<Input, Error> + Siz
     #[inline]
     fn spawn(self, input: Input) -> tokio::task::JoinHandle<Result<Self::Output, Error>>
     where
-        Self: TryAsyncChainSend<Input, Error> + Send + 'static,
+        Self: for<'run> TryAsyncChainSend<'run, Input, Error> + Send + 'static,
         Input: Send + 'static,
         Error: Send + 'static,
         Self::Output: Send + 'static,

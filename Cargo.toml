@@ -10,7 +10,7 @@ homepage = "https://github.com/LuticaCANARD/skid-pipe"
 documentation = "https://docs.rs/skid-pipe"
 keywords = ["pipeline", "compose", "no-std", "embedded", "wasm"]
 categories = ["no-std", "wasm"]
-rust-version = "1.86"
+rust-version = "1.98.1"
 
 [lib]
 path = "src/lib.rs"

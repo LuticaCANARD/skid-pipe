@@ -56,23 +56,38 @@ macro_rules! ladder_emit {
         [$out:ty] [$($b:tt)*] [$($fwd:ident)*] [$($extra:ident)*] [$bottom:ty]
         $this:ident $inp:ident $car:ident [$($body:tt)*]
     ) => {
-        impl<$($fwd,)* $($extra,)* $($gen)*> $($chain)* for ladder_ty!($pipe, $bottom; $($fwd)*)
+        impl<$($gen)*, $($fwd,)* $($extra,)*> $($chain)* for ladder_ty!($pipe, $bottom; $($fwd)*)
         where
             $($b)*
         {
             ladder_assoc!($assoc, $out);
 
-            #[inline(always)]
-            // Clippy asks for `async fn`; the two do not lay out the same. On
-            // the 100-stage footprint example the `async fn` form measures
-            // 320 B against this one's 216 B, so the lint is refused here.
-            #[allow(clippy::manual_async_fn)]
-            fn $method(&mut self, $inp: Input) -> impl ::core::future::Future<Output = $($ret)*> $($send)* {
-                let $this = self;
-                async move {
-                    $($body)*
-                    $car
-                }
+            ladder_method!([$($gen)*] [$method] [$($ret)*] [$($send)*]
+                $this $inp $car [$($body)*]);
+        }
+    };
+}
+
+/// Selects the receiver lifetime without changing the async block layout.
+macro_rules! ladder_method {
+    ([$run:lifetime, $($gen:tt)*] $($rest:tt)*) => {
+        ladder_method!(@method [$run] $($rest)*);
+    };
+    ([$($gen:tt)*] $($rest:tt)*) => {
+        ladder_method!(@method [] $($rest)*);
+    };
+    (@method [$($run:lifetime)?] [$method:ident] [$($ret:tt)*] [$($send:tt)*]
+     $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
+        #[inline(always)]
+        // Keep the measured async-block layout; see AsyncChain's docs.
+        #[allow(clippy::manual_async_fn)]
+        fn $method(& $($run)? mut self, $inp: Input)
+            -> impl ::core::future::Future<Output = $($ret)*> $($send)*
+        {
+            let $this = self;
+            async move {
+                $($body)*
+                $car
             }
         }
     };
@@ -146,18 +161,18 @@ macro_rules! ladder_impl {
 /// one: the stage itself, the future it hands back, and the value it carries
 /// must all be `Send` for the composed `async` block to be.
 macro_rules! ladder_send_impl {
-    ([$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$($gen:tt)*]
+    ([$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$run:lifetime, $($gen:tt)*]
      [$($assoc:tt)*] [$($send:tt)*] [$step:ident $($eargs:tt)*] [$($q:tt)*]
      [$($sendgen:tt)*] end $($s:ident)+) => {
-        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$($gen)*]
+        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$run, $($gen)*]
             [$($assoc)*] [$($send)*] [$step $($eargs)*] [$($q)*]
             [Input] [Input: Send, $($sendgen)*] [] [] [End]
             this input carried [let carried = input;] $($s)+);
     };
-    ([$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$($gen:tt)*]
+    ([$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$run:lifetime, $($gen:tt)*]
      [$($assoc:tt)*] [$($send:tt)*] [$step:ident $($eargs:tt)*] [$($q:tt)*]
      [$($sendgen:tt)*] rest [$($tailbound:tt)*] [$($tailout:tt)*] $($s:ident)+) => {
-        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$($gen)*]
+        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$run, $($gen)*]
             [$($assoc)*] [$($send)*] [$step $($eargs)*] [$($q)*]
             [$($tailout)*] [Input: Send, $($sendgen)* $($tailbound)*] [] [TailHead TailTail]
             [$pipe<TailHead, TailTail>]
@@ -166,40 +181,40 @@ macro_rules! ladder_send_impl {
             $($s)+);
     };
 
-    (@go [$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$($gen:tt)*]
+    (@go [$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$run:lifetime, $($gen:tt)*]
      [$($assoc:tt)*] [$($send:tt)*] [$step:ident $($eargs:tt)*] [$($q:tt)*]
      [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] [$($extra:ident)*] [$bottom:ty]
      $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident $($rest:ident)+) => {
-        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$($gen)*]
+        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$run, $($gen)*]
             [$($assoc)*] [$($send)*] [$step $($eargs)*] [$($q)*]
             [<$s as $step<$cur $($eargs)*>>::Output]
-            [$($b)* $s: $step<$cur $($eargs)*> + Send,
-             for<'a> <$s as $step<$cur $($eargs)*>>::Future<'a>: Send,
+            [$($b)* $s: $step<$cur $($eargs)*> + Send + $run,
+             <$s as $step<$cur $($eargs)*>>::Future<$run>: Send,
              <$s as $step<$cur $($eargs)*>>::Output: Send,]
             [$($fwd)* $s] [$($extra)*] [$bottom]
             $this $inp $car
-            [$($body)* let $car = ladder_at!($this; $($rest)+).head.call($car).await $($q)*;]
+            [$($body)* let $car = call_send::<$cur, $s $($eargs)*>(&mut ladder_at!($this; $($rest)+).head, $car).await $($q)*;]
             $($rest)+);
     };
-    (@go [$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$($gen:tt)*]
+    (@go [$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$run:lifetime, $($gen:tt)*]
      [$($assoc:tt)*] [$($send:tt)*] [$step:ident $($eargs:tt)*] [$($q:tt)*]
      [$cur:ty] [$($b:tt)*] [$($fwd:ident)*] [$($extra:ident)*] [$bottom:ty]
      $this:ident $inp:ident $car:ident [$($body:tt)*] $s:ident) => {
-        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$($gen)*]
+        ladder_send_impl!(@go [$pipe] [$($chain)*] [$method] [$($ret)*] [$run, $($gen)*]
             [$($assoc)*] [$($send)*] [$step $($eargs)*] [$($q)*]
             [<$s as $step<$cur $($eargs)*>>::Output]
-            [$($b)* $s: $step<$cur $($eargs)*> + Send,
-             for<'a> <$s as $step<$cur $($eargs)*>>::Future<'a>: Send,
+            [$($b)* $s: $step<$cur $($eargs)*> + Send + $run,
+             <$s as $step<$cur $($eargs)*>>::Future<$run>: Send,
              <$s as $step<$cur $($eargs)*>>::Output: Send,]
             [$($fwd)* $s] [$($extra)*] [$bottom]
             $this $inp $car
-            [$($body)* let $car = $this.head.call($car).await;]);
+            [$($body)* let $car = call_send::<$cur, $s $($eargs)*>(&mut $this.head, $car).await;]);
     };
-    (@go [$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$($gen:tt)*]
+    (@go [$pipe:ident] [$($chain:tt)*] [$method:ident] [$($ret:tt)*] [$run:lifetime, $($gen:tt)*]
      [$($assoc:tt)*] [$($send:tt)*] [$step:ident $($eargs:tt)*] [$($q:tt)*]
      [$out:ty] [$($b:tt)*] [$($fwd:ident)*] [$($extra:ident)*] [$bottom:ty]
      $this:ident $inp:ident $car:ident [$($body:tt)*]) => {
-        ladder_emit!([$pipe] [$($chain)*] [$method] [$($ret)*] [$($gen)*]
+        ladder_emit!([$pipe] [$($chain)*] [$method] [$($ret)*] [$run, $($gen)*]
             [$($assoc)*] [$($send)*]
             [$out] [$($b)*] [$($fwd)*] [$($extra)*] [$bottom]
             $this $inp $car [$($body)*]);

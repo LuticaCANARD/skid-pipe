@@ -8,6 +8,36 @@ API changes. See the compatibility policy in the README before upgrading.
 
 ## [Unreleased]
 
+### Fixed
+
+- Align the CI matrix and its dependency pinning conditions with the declared
+  minimum Rust version.
+- Allow `run_send` to execute stages borrowing local state, including named
+  stages whose futures borrow mutable state. The Send ladder now checks the
+  future for the actual run lifetime instead of every possible lifetime.
+- Correct the async state documentation: `FnMut` stages can retain state by
+  updating captures before constructing their futures, and named stages can
+  lend mutable state to their futures. The copied `async move` capture example
+  is a specific pitfall, not a limitation on all async state retention.
+
+### Changed
+
+- Raise the MSRV from Rust 1.86 to Rust 1.98.1. Pin the repository toolchain to
+  1.98.1 and test both that version and stable in CI. Update the pinned Miri
+  nightly to 2026-09-10 to meet the new MSRV. Rust 1.86-specific
+  lifetime workarounds are no longer needed. This requires a semver-minor
+  release under the crate's compatibility policy.
+- **Breaking; requires a semver-minor release.** `AsyncChainSend` and
+  `TryAsyncChainSend` now take the pipeline borrow lifetime as their first
+  parameter. Direct calls to `run_send` and Tokio's `spawn` keep their syntax.
+  Generic helpers taking `&'run mut P` should use
+  `P: AsyncChainSend<'run, Input>` (or
+  `P: TryAsyncChainSend<'run, Input, Error>`). Builders returning an owned
+  spawnable pipeline should replace `AsyncChainSend<Input>` with
+  `for<'run> AsyncChainSend<'run, Input>`, and use the corresponding fallible
+  bound. External implementations must likewise tie `run_send`'s receiver
+  to the trait lifetime. The plain chain and stage traits are unchanged.
+
 ## [0.3.0] - 2026-08-31
 
 Async sequencing is now written as `async` blocks instead of hand-written state

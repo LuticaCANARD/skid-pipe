@@ -1,9 +1,9 @@
 //! Asynchronous branching without a dedicated combinator: an `if`/`match`
 //! inside the stage future, where only the selected arm is awaited.
 //!
-//! A stage closure is `FnMut`, so branch state lives in a `Cell` captured by
-//! shared reference. Moving it into the returned future instead would make the
-//! closure `FnOnce`, which cannot be a repeatable stage.
+//! These examples update branch state inside the future using a shared `Cell`.
+//! Stages may also update captured state before returning a future, or use a
+//! named stage whose future borrows mutable state.
 
 use core::{cell::Cell, future::Future};
 use std::{

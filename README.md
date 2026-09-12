@@ -119,7 +119,7 @@ errors in a 100-stage chain. Async comparisons use the same
 the measured loop, matching a reusable pipeline's normal use:
 
 ```sh
-cargo +1.86 bench --bench composition -- \
+cargo +1.98.1 bench --bench composition -- \
   --warm-up-time 1 --measurement-time 2 --sample-size 50
 ```
 
@@ -207,11 +207,29 @@ assert_eq!(pipeline.run(7), (7, 2));
 The mutable pipeline borrow makes this sequencing explicit. Synchronization for
 state shared outside the pipeline remains the caller's responsibility.
 
-This applies to `Pipe` and `TryPipe`. **An async stage cannot keep state by
-capturing it into the future it returns.** `AsyncStep`'s blanket implementation
-maps a stage to `type Future<'a> = Fut`, which does not borrow the closure, so
-each call moves a fresh copy of the captured state into a new future and the
-original is never updated. This compiles and silently counts nothing:
+`AsyncPipe` and `TryAsyncPipe` also retain `FnMut` state. Update the captured
+state in the closure before constructing its future:
+
+```rust
+use skid_pipe::AsyncPipe;
+
+# async fn example() {
+let mut calls = 0_u32;
+let mut pipeline = AsyncPipe::new(move |value: u16| {
+    calls += 1;
+    core::future::ready((value, calls))
+});
+
+assert_eq!(pipeline.run(7).await, (7, 1));
+assert_eq!(pipeline.run(7).await, (7, 2));
+# }
+```
+
+The closure runs when the pipeline's future is polled, so dropping an unpolled
+run does not update the counter. Changes made by a stage that has already run
+are retained when a later stage fails or the run is cancelled.
+
+Updating a copied capture **inside** an `async move` block behaves differently:
 
 ```rust
 use skid_pipe::AsyncPipe;
@@ -224,12 +242,20 @@ let mut pipeline = AsyncPipe::new(move |value: u16| async move {
 });
 
 assert_eq!(pipeline.run(7).await, (7, 1));
-assert_eq!(pipeline.run(7).await, (7, 1)); // not (7, 2)
+assert_eq!(pipeline.run(7).await, (7, 1)); // each future updates its own copy
 # }
 ```
 
-Hold async state in a [`Cell`](https://doc.rust-lang.org/core/cell/struct.Cell.html)
-captured by shared reference instead:
+Here `u32` is `Copy`, so each future receives a fresh copy. Moving owned,
+non-`Copy` state out of the closure can instead make it `FnOnce`, which cannot
+serve as a reusable stage. The blanket `AsyncStep` implementation accepts
+`FnMut` functions returning a fixed future type; that future cannot borrow the
+closure's own mutable state.
+
+When state must be updated inside the future, capture shared state by reference
+or implement a named `AsyncStep` / `TryAsyncStep`. A named stage's
+`Future<'a>` may borrow `&'a mut self`, including across suspension points.
+For example, shared local state can use [`Cell`](https://doc.rust-lang.org/core/cell/struct.Cell.html):
 
 ```rust
 use core::cell::Cell;
@@ -250,9 +276,9 @@ assert_eq!(pipeline.run(7).await, (7, 2));
 # }
 ```
 
-That `Cell` is ordinary Rust and works with or without this crate, so async
-state retention is not something `skid-pipe` gives you. Composition as a value
-is. `TryAsyncPipe` behaves the same way.
+A shared `Cell` reference is not `Send`; use suitable synchronized state if the
+future must move between threads. `TryAsyncPipe` supports the same state
+patterns, with errors stopping later stages.
 
 ## Branching
 
@@ -344,22 +370,46 @@ Tokio's `Send + 'static` boundary. A run future created from a pipeline that
 stays on the caller's stack borrows that pipeline and therefore cannot itself
 be made `'static`.
 
-The composed future is an unnameable `impl Future`, so that `Send` bound cannot
-be written directly. `AsyncChainSend` and `TryAsyncChainSend` restate the same
-composition with `Send` promised in the return type, and `spawn` asks for them.
-Concrete pipelines get them automatically, but a builder that hides its type
-must say so:
+The composed future is an unnameable `impl Future`, so generic code cannot
+add a `Send` bound directly to `AsyncChain::run`'s return type.
+`AsyncChainSend<'run, Input>` and `TryAsyncChainSend<'run, Input, Error>`
+promise `Send` for the duration of one pipeline borrow. Their `run_send`
+methods also support stages that borrow local state:
 
-```rust,ignore
+```rust
+use skid_pipe::{AsyncChainSend, AsyncPipe};
+
+# async fn example() {
+let offset = 3_u32;
+let mut pipeline = AsyncPipe::new(|value: u32| core::future::ready(value + offset));
+let future = pipeline.run_send(4);
+fn require_send<F: core::future::Future + Send>(future: F) -> F { future }
+assert_eq!(require_send(future).await, 7);
+# }
+```
+
+Use `run_send` when borrowed stage state must produce a `Send` future. Rust's
+GAT lifetime limitations can prevent proving `Send` for the ordinary `run`
+future in this case. `run_send` checks stage futures for the actual borrow
+lifetime and does not require the captured references to be `'static`.
+
+Tokio's `spawn` still requires ownership and `'static`. A builder hiding an
+owned pipeline's concrete type must promise `Send` execution for every borrow:
+
+```rust
 use skid_pipe::{AsyncChain, AsyncChainSend, AsyncPipe};
 
-fn build() -> impl AsyncChain<u8, Output = bool> + AsyncChainSend<u8> {
+async fn fetch(value: u8) -> u16 { u16::from(value) }
+async fn classify(value: u16) -> bool { value > 10 }
+
+fn build() -> impl AsyncChain<u8, Output = bool> + for<'run> AsyncChainSend<'run, u8> {
     AsyncPipe::new(fetch).then(classify)
 }
 ```
 
-Without the second bound the builder's pipeline still runs and awaits; only
-`spawn` refuses it.
+The fallible equivalent is `for<'run> TryAsyncChainSend<'run, Input, Error>`.
+For a generic helper borrowing a pipeline, bind the particular borrow instead:
+`P: AsyncChainSend<'run, Input>` with `pipeline: &'run mut P`.
 
 For a non-`Send` stage, use Tokio's
 [`LocalSet::spawn_local`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html#method.spawn_local)
@@ -408,7 +458,7 @@ polled `FnMut` stages are retained.
 ## Long async chains and embedded stacks
 
 All four pipeline variants are compiled and executed with 100 stages on the
-declared Rust 1.86 MSRV without requiring callers to raise rustc's default
+declared Rust 1.98.1 MSRV without requiring callers to raise rustc's default
 recursion limit. Async chains put each group of sixteen stages into one `async`
 block, and rustc overlaps a group's stage futures into a single slot, so the
 run future stops growing once a group is full.
@@ -512,9 +562,10 @@ connection is checked only inside its own body. That is what `skid-pipe` sells,
 and it is not speed. When the chain is short and lives in one place, write the
 `async fn`.
 
-Neither does `skid-pipe` fix the one reuse problem an `async fn` does have:
-state across calls needs a `Cell` either way, as
-[Stateful pipelines](#stateful-pipelines) shows.
+State across calls can live in a `FnMut` stage or a named stage that lends its
+state to its future. A plain `async fn` can similarly accept mutable state as an
+argument. See [Stateful pipelines](#stateful-pipelines) for the supported
+patterns and the copied-capture pitfall.
 
 Tower is the closest reusable abstraction with a different purpose. Its
 services have a readiness protocol and address server/client middleware; it is
@@ -561,7 +612,7 @@ ordinary procedural Rust is usually clearer.
 
 ## Platform validation
 
-CI checks the static core on stable Rust and the declared MSRV (Rust 1.86),
+CI checks the static core on stable Rust and the declared MSRV (Rust 1.98.1),
 including representative targets:
 
 - `wasm32-unknown-unknown`
@@ -575,7 +626,7 @@ logging framework, or model runtime belong in separate adapter crates.
 
 ## Versioning and compatibility
 
-The minimum supported Rust version (MSRV) is Rust 1.86. CI checks both the MSRV
+The minimum supported Rust version (MSRV) is Rust 1.98.1. CI checks both the MSRV
 and stable Rust. An MSRV increase is treated as a semver-minor change and is
 recorded in the [changelog](CHANGELOG.md).
 
@@ -604,7 +655,7 @@ cargo test
 cargo test --features tokio
 cargo test --features wide
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo +1.86 bench --bench composition -- --warm-up-time 1 --measurement-time 2 --sample-size 50
+cargo +1.98.1 bench --bench composition -- --warm-up-time 1 --measurement-time 2 --sample-size 50
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32v1-none
 cargo check --target thumbv6m-none-eabi
@@ -613,5 +664,5 @@ cargo check --target riscv32imac-unknown-none-elf
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target wasm32v1-none
 cargo check --manifest-path tests/fixtures/no_std/Cargo.toml --target thumbv6m-none-eabi
 cargo check --target thumbv6m-none-eabi --features wide
-cargo +nightly-2026-04-03 miri test --test async_pipeline --test erasure --test try_async_pipeline --test hundred_stages
+cargo +nightly-2026-09-10 miri test --test async_pipeline --test borrowed_send --test erasure --test try_async_pipeline --test hundred_stages
 ```

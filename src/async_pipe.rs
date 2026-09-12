@@ -156,55 +156,87 @@ const _: () = {
     ladder_impl!([AsyncPipe] [AsyncChain<Input>] [run] [Self::Output] [Input] [owned] [] [AsyncStep] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChain<Input>,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
 };
 
-/// The `Send` variant of [`AsyncChain`].
+/// The `Send` variant of [`AsyncChain`] for one pipeline borrow.
 ///
-/// [`AsyncChain::run`] returns an unnameable `impl Future`, so a caller that
-/// must prove the composed future is `Send` (a `tokio::spawn` boundary) cannot
-/// write that bound. This trait restates the same composition with `Send`
-/// promised in the return type. A stage future stays nameable through
-/// [`AsyncStep::Future`], so its bound is expressible here.
-pub trait AsyncChainSend<Input>: AsyncChain<Input> {
+/// The stage futures only need to be `Send` for `'run`. Stages may borrow
+/// non-`'static` state, including through a hand-written [`AsyncStep`].
+/// Use `run_send` when a borrowed pipeline must produce a `Send` future;
+/// Rust's GAT lifetime limitations may prevent proving `Send` for `run`.
+///
+/// Generic helpers borrowing a pipeline should use the same `'run` lifetime
+/// on their receiver and this bound. An owned Tokio task instead requires
+/// `for<'run> AsyncChainSend<'run, Input>` as well as `Send + 'static`.
+///
+/// A `Send` stage whose future holds non-`Send` data across an await is refused:
+///
+/// ```compile_fail
+/// use skid_pipe::{AsyncChainSend, AsyncPipe};
+/// use std::rc::Rc;
+///
+/// let mut pipeline = AsyncPipe::new(|()| async {
+///     let value = Rc::new(1_u32);
+///     core::future::pending::<()>().await;
+///     *value
+/// });
+/// drop(pipeline.run_send(()));
+/// ```
+pub trait AsyncChainSend<'run, Input>: AsyncChain<Input> {
     /// Creates the future that runs this chain, promising `Send`.
-    fn run_send(&mut self, input: Input) -> impl Future<Output = Self::Output> + Send;
+    fn run_send(&'run mut self, input: Input) -> impl Future<Output = Self::Output> + Send;
 }
 
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
+// Hide the lifetime-specific GAT projection behind an opaque Send future.
+// Even with Future<'run>: Send, awaiting the projection directly in an async
+// block makes rustc demand Send for every lifetime (and implies 'static).
+#[inline(always)]
+fn call_send<'run, Input, Stage>(
+    stage: &'run mut Stage,
+    input: Input,
+) -> impl Future<Output = Stage::Output> + Send
+where
+    Stage: AsyncStep<Input>,
+    Stage::Future<'run>: Send,
+{
+    stage.call(input)
+}
+
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
 #[cfg(not(feature = "wide"))]
-ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
+ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChainSend<'run, Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16);
 
 #[cfg(feature = "wide")]
 const _: () = {
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
-    ladder_send_impl!([AsyncPipe] [AsyncChainSend<Input>] [run_send] [Self::Output] [Input] [inherited] [+ Send] [AsyncStep] [] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChainSend<Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  end S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
+    ladder_send_impl!([AsyncPipe] [AsyncChainSend<'run, Input>] [run_send] [Self::Output] ['run, Input] [inherited] [+ Send] [AsyncStep] [] []  rest [AsyncPipe<TailHead, TailTail>: AsyncChainSend<'run, Input> + Send, <AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output: Send,] [<AsyncPipe<TailHead, TailTail> as AsyncChain<Input>>::Output] S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32);
 };

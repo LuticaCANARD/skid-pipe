@@ -70,3 +70,24 @@ fn spawns_a_non_send_pipeline_on_a_local_set() {
     assert_eq!(output, 5);
     assert_eq!(try_output, Ok(6));
 }
+
+#[test]
+fn spawns_owned_pipelines_returned_from_generic_api_boundaries() {
+    use skid_pipe::{AsyncChain, AsyncChainSend, TryAsyncChain, TryAsyncChainSend};
+
+    fn build() -> impl AsyncChain<u16, Output = u16> + for<'run> AsyncChainSend<'run, u16> {
+        AsyncPipe::new(increment)
+    }
+    fn build_try() -> impl TryAsyncChain<u16, &'static str, Output = u16>
+    + for<'run> TryAsyncChainSend<'run, u16, &'static str> {
+        TryAsyncPipe::new(try_increment)
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        assert_eq!(build().spawn(2).await.unwrap(), 3);
+        assert_eq!(build_try().spawn(2).await.unwrap(), Ok(3));
+    });
+}

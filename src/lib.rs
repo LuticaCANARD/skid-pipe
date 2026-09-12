@@ -107,9 +107,10 @@
 //! ```
 //!
 //! The same holds for [`AsyncPipe`], where only the selected arm is awaited.
-//! A stage closure is [`FnMut`], so a branch that keeps state across runs
-//! holds it in a [`Cell`](core::cell::Cell) captured by shared reference
-//! rather than moving it into the returned future.
+//! A [`FnMut`] stage can update captured state before returning its future.
+//! To update state inside the future, use shared state such as a
+//! [`Cell`](core::cell::Cell), or implement [`AsyncStep`] for a named stage
+//! whose future borrows its mutable state.
 //!
 //! # Type names
 //!
